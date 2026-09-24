@@ -179,7 +179,7 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
         mfaRequired: store.mfaRequired(user),
         mfaSetupRequired: Boolean(session && session.mfaSetupRequired),
       },
-      org: { id: org.id, type: org.type, name: org.name, municipality: org.municipality, manages: org.manages },
+      org: { id: org.id, type: org.type, name: org.name, municipality: org.municipality, manages: org.manages, phone: org.phone },
     };
   }
 

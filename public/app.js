@@ -495,6 +495,7 @@ async function renderSchoolInput(el, links) {
         <li>黄色の「公開する」ボタンを押すと、変更点の一覧が表示されます。確認してから公開すると、承認済みの学童（現在 ${approved} か所）に通知されます。</li>
         <li>公開後に変更があれば、表を直して再度公開するだけです。学童には「修正」として変更箇所だけが届きます。</li>
         <li>学童が内容を確認したかどうかは「公開履歴・確認状況」で分かります。</li>
+        <li><b>今までどおり紙・FAXで送ることもできます。</b>表に入力して「印刷（FAX・配布用）」を押すと、宛先入りの下校時刻表が印刷できます。参加している学童がいなくても使えます。</li>
       </ol>
       <p class="muted">児童の氏名などの個人情報は入力しません。扱うのは学年ごとの下校時刻と備考だけです。</p>
     </details>
@@ -504,7 +505,7 @@ async function renderSchoolInput(el, links) {
       <h1>${fmtMonth(state.month)}</h1>
       <button class="btn" id="next-month">次の月 ▶</button>
       <span class="spacer"></span>
-      <button class="btn no-print" id="print-btn">印刷（配布用）</button>
+      <button class="btn no-print" id="print-btn">印刷（FAX・配布用）</button>
     </div>
 
     <div id="pending-bar"></div>
@@ -537,10 +538,7 @@ async function renderSchoolInput(el, links) {
 
   el.querySelector('#prev-month').addEventListener('click', () => { state.month = shiftMonth(state.month, -1); renderSchool(); });
   el.querySelector('#next-month').addEventListener('click', () => { state.month = shiftMonth(state.month, 1); renderSchool(); });
-  el.querySelector('#print-btn').addEventListener('click', () => {
-    if (state.pending.changes.length && !confirm('未公開の変更があります。このまま印刷すると、まだ公開していない内容も印刷されます。よろしいですか？')) return;
-    window.print();
-  });
+  el.querySelector('#print-btn').addEventListener('click', () => openFaxDialog('month'));
 
   const grid = el.querySelector('#month-grid');
   grid.addEventListener('change', withErrors(async (e) => {
@@ -796,10 +794,95 @@ async function renderSchoolReleases(el) {
           <b class="${waiting.length ? 'text-danger' : 'text-ok'}">確認済み ${done} / ${r.acks.length}</b></div>
         ${r.message ? `<p class="message">${esc(r.message)}</p>` : ''}
         ${changesHtml(r.changes)}
+        <div class="row no-print"><button class="btn small" data-fax="${r.id}">この変更をFAX用に印刷</button></div>
         <div class="acks">${r.acks.map((a) => `<span class="ack${a.ackedAt ? ' done' : ''}">${esc(a.gakudoName)}：${a.ackedAt ? `確認済 ${esc(fmtDateTime(a.ackedAt))}` : `未確認${r.urgent && a.gakudoPhone ? `（☎ ${esc(a.gakudoPhone)}）` : ''}`}</span>`).join('')}</div>
         ${r.urgent && waiting.length ? '<p class="alert">当日・翌日の変更です。未確認の学童には念のため電話でのご連絡をおすすめします。</p>' : ''}
       </article>`;
     }).join('')}`;
+  el.querySelectorAll('[data-fax]').forEach((b) =>
+    b.addEventListener('click', () => openFaxDialog('revision', releases.find((r) => r.id === b.dataset.fax))));
+}
+
+// ---- 紙・FAX 用の印刷（学童がシステムに参加していなくても、従来どおり送れるように） ----
+
+function openFaxDialog(kind, release) {
+  const org = state.me.org;
+  const savedTo = storageGet('fax-to') || '放課後児童クラブ 各位';
+  const savedPhone = storageGet('fax-phone') || org.phone || '';
+  const hasDraft = kind === 'month' && state.pending.changes.length > 0;
+  const dlg = openDialog(`<form id="fax-form"><div class="dialog-body">
+    <h2>${kind === 'month' ? `${fmtMonth(state.month)}の下校時刻表を印刷` : '変更のお知らせを印刷'}</h2>
+    <p class="muted">白黒のFAXでも読みやすい様式で印刷します。</p>
+    ${hasDraft ? '<p class="alert">まだ公開していない変更があります。印刷には画面に表示中の内容（未公開の変更を含む）が使われます。</p>' : ''}
+    <label>宛先<input name="to" value="${esc(savedTo)}" placeholder="例）〇〇学童クラブ 御中"></label>
+    <label>発信元の電話番号<input name="phone" value="${esc(savedPhone)}" placeholder="例）0278-00-0000"></label>
+    <label>担当者名（任意）<input name="person" value="${esc(storageGet('fax-person') || '')}"></label>
+    </div>
+    <div class="dialog-actions"><button type="button" class="btn" data-close>キャンセル</button><button class="btn primary">印刷する</button></div></form>`);
+  dlg.querySelector('#fax-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const f = e.target;
+    storageSet('fax-to', f.to.value);
+    storageSet('fax-phone', f.phone.value);
+    storageSet('fax-person', f.person.value);
+    const head = { to: f.to.value.trim(), phone: f.phone.value.trim(), person: f.person.value.trim() };
+    dlg.close();
+    printSheet(kind === 'month' ? monthSheetHtml(head) : revisionSheetHtml(head, release));
+  });
+}
+
+// 学校の書類に合わせて和暦で書く（2019年5月以降＝令和）
+const reiwa = (y) => `令和${y - 2018 === 1 ? '元' : y - 2018}年`;
+const fmtMonthJa = (m) => `${reiwa(Number(m.slice(0, 4)))}${Number(m.slice(5))}月`;
+
+function sheetHeadHtml(head, title) {
+  const to = head.to && !/(御中|各位|様)$/.test(head.to) ? `${head.to} 御中` : head.to;
+  const d = new Date();
+  return `<div class="sheet-head">
+      <div class="sheet-to">${esc(to || '')}</div>
+      <div class="sheet-from">${reiwa(d.getFullYear())}${d.getMonth() + 1}月${d.getDate()}日<br>${esc(state.me.org.name)}<br>
+        ${head.person ? `担当：${esc(head.person)}<br>` : ''}${head.phone ? `電話：${esc(head.phone)}` : ''}</div>
+    </div>
+    <h1 class="sheet-title">${esc(title)}</h1>`;
+}
+
+function monthSheetHtml(head) {
+  const dates = monthDates(state.month).filter((d) => currentDay(d).grades.some((g) => g) || currentDay(d).note || (dowOf(d) >= 1 && dowOf(d) <= 5));
+  return `${sheetHeadHtml(head, `下校時刻のお知らせ（${fmtMonthJa(state.month)}）`)}
+    <p>${fmtMonthJa(state.month)}の下校時刻を下記のとおりお知らせします。変更がある場合は、改めてご連絡します。</p>
+    <table class="sheet-table"><thead><tr><th>日付</th>${Array.from({ length: GRADES }, (_, i) => `<th>${i + 1}年</th>`).join('')}<th>備考</th></tr></thead>
+    <tbody>${dates.map((d) => {
+      const day = currentDay(d);
+      const empty = !day.grades.some((g) => g);
+      return `<tr><td>${esc(fmtDate(d))}</td>${empty && !day.note ? `<td colspan="${GRADES + 1}">（下校時刻なし）</td>` : day.grades.map((g) => `<td>${esc(g || '―')}</td>`).join('') + `<td class="sheet-note">${esc(day.note)}</td>`}</tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+function revisionSheetHtml(head, r) {
+  return `${sheetHeadHtml(head, '下校時刻 変更のお知らせ')}
+    <p>先にお知らせした下校時刻を、下記のとおり変更します。${r.urgent ? '<b>当日・翌日の変更を含みます。</b>' : ''}</p>
+    ${r.message ? `<p class="sheet-message">${esc(r.message)}</p>` : ''}
+    <table class="sheet-table"><thead><tr><th>日付</th><th>学年</th><th>変更前</th><th>変更後</th></tr></thead>
+    <tbody>${r.changes.map((c) => `<tr><td>${esc(fmtDate(c.date))}</td><td>${c.field === 'note' ? '備考' : `${c.grade}年`}</td>
+      <td>${esc(c.before || '（なし）')}</td><td class="sheet-after">★ ${esc(c.after || '（なし）')}</td></tr>`).join('')}</tbody></table>
+    <p class="sheet-small">★印が変更後の内容です。</p>`;
+}
+
+function printSheet(html) {
+  let sheet = document.getElementById('print-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'print-sheet';
+    document.body.appendChild(sheet);
+  }
+  sheet.innerHTML = `<div class="sheet">${html}</div>`;
+  document.body.classList.add('print-sheet-mode');
+  const done = () => {
+    document.body.classList.remove('print-sheet-mode');
+    window.removeEventListener('afterprint', done);
+  };
+  window.addEventListener('afterprint', done);
+  window.print();
 }
 
 function renderSchoolLinks(el, links) {
