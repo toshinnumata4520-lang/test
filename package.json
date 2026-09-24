@@ -1,0 +1,15 @@
+{
+  "name": "tone-numata-dismissal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "利根沼田 下校時刻共有システム（学校・学童・保護者）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}
