@@ -219,3 +219,19 @@ dialog .alert ul { margin: 4px 0; padding-left: 20px; }
 .disabled-row { color: var(--muted); background: #fafafa; }
 .audit-fail { background: var(--danger-weak); }
 dialog select { display: block; width: 100%; margin-top: 4px; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
+
+/* ---- 学童：お迎え順の一覧・月の一覧 ---- */
+.timeline { border-left: 4px solid var(--primary); }
+.timeline-table { border-collapse: collapse; width: 100%; }
+.timeline-table th { width: 80px; text-align: left; vertical-align: top; font-size: 20px; font-variant-numeric: tabular-nums; padding: 6px 8px 6px 0; }
+.timeline-table td { padding: 6px 0; border-bottom: 1px dashed var(--line); }
+.timeline-table tr:last-child td { border-bottom: none; }
+.pill { display: inline-block; background: var(--primary-weak); border-radius: 16px; padding: 3px 12px; margin: 2px 6px 2px 0; font-weight: 600; }
+.pill.changed { background: var(--danger-weak); color: var(--danger); }
+.timeline .note-box { margin-top: 8px; }
+@media print {
+  .timeline-table th { font-size: 16px; }
+  .month-school { page-break-after: always; }
+  .month-school:last-child { page-break-after: auto; }
+  .alert { display: none; }
+}

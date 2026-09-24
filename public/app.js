@@ -879,6 +879,7 @@ async function renderGakudo() {
   const body = document.createElement('div');
   appEl.innerHTML = pushBarHtml() + tabsHtml([
     ['today', '今日・今週の下校時刻'],
+    ['month', '月の一覧'],
     ['news', 'お知らせ（公開・修正）', unread.length],
     ['schools', '受け取る学校・通知設定'],
     ...adminTabs(),
@@ -888,31 +889,70 @@ async function renderGakudo() {
   bindPushBar();
   if (await renderAdminTab(body)) return;
   if (state.tab === 'today') await renderGakudoToday(body, unread);
+  if (state.tab === 'month') await renderGakudoMonth(body, unread);
   if (state.tab === 'news') renderGakudoNews(body, releases);
   if (state.tab === 'schools') await renderGakudoSchools(body);
+}
+
+// 未確認のお知らせで修正された箇所（月初の新規公開などは含めない）
+function changedKeys(unread) {
+  const changed = new Set();
+  for (const r of unread) {
+    for (const c of r.changes) if (c.before || c.field === 'note') changed.add(`${r.schoolId}|${c.date}|${c.grade || 'note'}`);
+  }
+  return changed;
+}
+
+// [1,2] → 「1・2年」、[4,5,6] → 「4〜6年」
+function gradesText(gs) {
+  if (gs.length === 1) return `${gs[0]}年`;
+  const consecutive = gs.every((g, i) => i === 0 || g === gs[i - 1] + 1);
+  if (consecutive && gs.length >= 3) return `${gs[0]}〜${gs[gs.length - 1]}年`;
+  return `${gs.join('・')}年`;
+}
+
+// 全校まとめて、下校時刻の早い順に並べる
+function pickupTimelineHtml(schools, date, changed) {
+  const byTime = new Map();
+  for (const s of schools) {
+    const day = s.days[date];
+    if (!day) continue;
+    const groups = {};
+    day.grades.forEach((t, i) => { if (t) (groups[t] = groups[t] || []).push(i + 1); });
+    for (const [t, gs] of Object.entries(groups)) {
+      if (!byTime.has(t)) byTime.set(t, []);
+      byTime.get(t).push({ name: s.name, grades: gs, changed: gs.some((g) => changed.has(`${s.id}|${date}|${g}`)) });
+    }
+  }
+  const notes = schools.filter((s) => s.days[date] && s.days[date].note);
+  if (!byTime.size) return '<section class="card timeline"><h2>お迎え順の一覧</h2><p class="muted">この日の下校時刻はまだ公開されていません。</p></section>';
+  return `<section class="card timeline"><h2>お迎え順の一覧（時刻の早い順）</h2>
+    <table class="timeline-table"><tbody>${[...byTime.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([t, items]) => `<tr>
+      <th>${esc(t)}</th><td>${items.map((it) => `<span class="pill${it.changed ? ' changed' : ''}">${esc(it.name)} ${gradesText(it.grades)}${it.changed ? '（修正）' : ''}</span>`).join('')}</td></tr>`).join('')}
+    </tbody></table>
+    ${notes.map((s) => `<div class="note-box${changed.has(`${s.id}|${date}|note`) ? ' changed' : ''}">📝 ${esc(s.name)}：${esc(s.days[date].note)}</div>`).join('')}
+  </section>`;
 }
 
 async function renderGakudoToday(el, unread) {
   const week = weekDates(state.date);
   const schools = await api('GET', `/api/gakudo/schedule?from=${week[0]}&to=${week[6]}`);
-  // 未確認のお知らせで変わった箇所を強調する
-  const changed = new Set();
-  // 月初の新規公開などは強調せず、公開済みの時刻が修正された箇所だけを赤くする
-  for (const r of unread) {
-    for (const c of r.changes) if (c.before || c.field === 'note') changed.add(`${r.schoolId}|${c.date}|${c.grade || 'note'}`);
-  }
+  const changed = changedKeys(unread);
   const isToday = state.date === todayStr();
 
   el.innerHTML = `
     ${unread.length ? `<div class="alert row"><span>🔔 <b>未確認のお知らせが ${unread.length} 件</b>あります。赤く表示されている箇所は修正された時刻です。</span><span class="spacer"></span><button class="btn small" id="go-news">お知らせを確認する</button></div>` : ''}
-    <div class="row">
+    <div class="row no-print">
       <button class="btn" id="prev-day">◀ 前の日</button>
       <input type="date" id="day" value="${state.date}">
       <button class="btn" id="next-day">次の日 ▶</button>
       ${isToday ? '' : '<button class="btn" id="to-today">今日</button>'}
+      <span class="spacer"></span>
+      <button class="btn" id="print-day">印刷</button>
     </div>
     <h1>${esc(fmtDate(state.date))}${isToday ? '（今日）' : ''}の下校時刻</h1>
-    ${schools.length ? '' : '<div class="card">まだ受け取る学校がありません。「受け取る学校」タブから学校に申請してください。</div>'}
+    ${schools.length ? pickupTimelineHtml(schools, state.date, changed) : '<div class="card">まだ受け取る学校がありません。「受け取る学校」タブから学校に申請してください。</div>'}
+    <h2 class="print-break">学校ごとの下校時刻</h2>
     <div class="today-grid">${schools.map((s) => {
       const day = s.days[state.date];
       return `<section class="card school-card"><h3>${esc(s.name)}</h3>
@@ -939,6 +979,36 @@ async function renderGakudoToday(el, unread) {
   if (toToday) toToday.addEventListener('click', () => setDate(todayStr()));
   const goNews = el.querySelector('#go-news');
   if (goNews) goNews.addEventListener('click', () => { state.tab = 'news'; renderGakudo(); });
+  el.querySelector('#print-day').addEventListener('click', () => window.print());
+}
+
+async function renderGakudoMonth(el, unread) {
+  if (!state.month) state.month = todayStr().slice(0, 7);
+  const dates = monthDates(state.month);
+  const schools = await api('GET', `/api/gakudo/schedule?from=${dates[0]}&to=${dates[dates.length - 1]}`);
+  const changed = changedKeys(unread);
+  const today = todayStr();
+  el.innerHTML = `
+    <div class="row">
+      <button class="btn no-print" id="prev-month">◀ 前の月</button>
+      <h1>${fmtMonth(state.month)}の下校時刻</h1>
+      <button class="btn no-print" id="next-month">次の月 ▶</button>
+      <span class="spacer"></span>
+      <button class="btn no-print" id="print-month">印刷</button>
+    </div>
+    ${schools.length ? '' : '<div class="card">まだ受け取る学校がありません。「受け取る学校」タブから学校に申請してください。</div>'}
+    ${schools.map((s) => `<section class="card month-school"><h2>${esc(s.name)}</h2>
+      <div class="table-wrap"><table class="grid"><thead><tr><th>日付</th>${Array.from({ length: GRADES }, (_, i) => `<th>${i + 1}年</th>`).join('')}<th>備考</th></tr></thead>
+      <tbody>${dates.filter((d) => s.days[d] || (dowOf(d) >= 1 && dowOf(d) <= 5)).map((d) => {
+        const day = s.days[d];
+        const dow = dowOf(d);
+        return `<tr class="${dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}${d === today ? ' is-today' : ''}"><td class="date">${esc(fmtDate(d))}</td>
+          ${day ? day.grades.map((g, i) => `<td class="time${changed.has(`${s.id}|${d}|${i + 1}`) ? ' changed-cell' : ''}">${esc(timeText(g))}</td>`).join('') + `<td class="${changed.has(`${s.id}|${d}|note`) ? 'changed-cell' : ''}">${esc(day.note)}</td>`
+            : `<td colspan="${GRADES + 1}" class="muted">未公開</td>`}</tr>`;
+      }).join('')}</tbody></table></div></section>`).join('')}`;
+  el.querySelector('#prev-month').addEventListener('click', () => { state.month = shiftMonth(state.month, -1); renderGakudo(); });
+  el.querySelector('#next-month').addEventListener('click', () => { state.month = shiftMonth(state.month, 1); renderGakudo(); });
+  el.querySelector('#print-month').addEventListener('click', () => window.print());
 }
 
 function renderGakudoNews(el, releases) {
