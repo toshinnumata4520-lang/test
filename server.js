@@ -16,6 +16,11 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const BODY_LIMIT = 256 * 1024;
 const LOGIN_MAX_FAILURES = 5;
 const LOGIN_LOCK_MS = 10 * 60 * 1000;
+const ADMIN_IDLE_MS = 30 * 60 * 1000; // 協議会・市町村の管理者は30分操作がないと自動ログアウト
+const MFA_TICKET_MS = 5 * 60 * 1000;
+const MFA_MAX_TRIES = 5;
+// 2段階認証の設定が済むまで使える API
+const MFA_SETUP_ALLOWED = new Set(['/api/me', '/api/logout', '/api/mfa/setup', '/api/mfa/enable']);
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -55,7 +60,8 @@ const SECURITY_HEADERS = {
 };
 
 function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUSH_SUBJECT || 'mailto:admin@example.com', secureCookie = process.env.SECURE_COOKIE === '1', trustProxy = process.env.TRUST_PROXY === '1' }) {
-  const sessions = new Map(); // token -> { userId, expires }
+  const sessions = new Map(); // token -> { userId, expires, lastSeen, mfaSetupRequired }
+  const mfaTickets = new Map(); // ticket -> { userId, expires, tries }
   const streams = new Map(); // orgId -> Set<res>
   const loginFailures = new Map(); // `${loginId}|${ip}` -> { count, lockedUntil }
   const routes = [];
@@ -124,35 +130,66 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
     return out;
   }
 
-  function currentUser(req) {
+  function currentSession(req) {
     const token = parseCookies(req).sid;
     const s = token && sessions.get(token);
     if (!s) return null;
-    if (s.expires < Date.now()) {
+    const user = store.user(s.userId);
+    const org = user && store.org(user.orgId);
+    const idleLimit = org && (org.type === 'council' || org.type === 'board') ? ADMIN_IDLE_MS : SESSION_TTL_MS;
+    if (!user || user.disabled || s.expires < Date.now() || Date.now() - s.lastSeen > idleLimit) {
       sessions.delete(token);
       return null;
     }
-    return store.user(s.userId);
+    s.lastSeen = Date.now();
+    return { token, session: s, user, org };
+  }
+
+  function startSession(res, user) {
+    const token = crypto.randomBytes(24).toString('hex');
+    sessions.set(token, {
+      userId: user.id,
+      expires: Date.now() + SESSION_TTL_MS,
+      lastSeen: Date.now(),
+      mfaSetupRequired: store.mfaRequired(user) && !user.mfa,
+    });
+    store.recordLogin(user.id);
+    res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_MS / 1000}${secureCookie ? '; Secure' : ''}`);
+    return sessions.get(token);
+  }
+
+  function log(ctx, action, opts = {}) {
+    store.audit(ctx.user, action, { ...opts, ip: ctx.ip });
   }
 
   function endSessionsOf(userId) {
     for (const [token, s] of sessions) if (s.userId === userId) sessions.delete(token);
   }
 
-  function publicMe(user) {
+  function publicMe(user, session) {
     const org = store.org(user.orgId);
     return {
-      user: { id: user.id, name: user.name, loginId: user.loginId },
-      org: { id: org.id, type: org.type, name: org.name, municipality: org.municipality },
+      user: {
+        id: user.id,
+        name: user.name,
+        loginId: user.loginId,
+        role: user.role,
+        isAdmin: store.isAdministrator(user),
+        mfaEnabled: Boolean(user.mfa),
+        mfaRequired: store.mfaRequired(user),
+        mfaSetupRequired: Boolean(session && session.mfaSetupRequired),
+      },
+      org: { id: org.id, type: org.type, name: org.name, municipality: org.municipality, manages: org.manages },
     };
   }
 
   // ---- API：共通 ----
 
-  route('POST', '/api/login', ({ req, body, res }) => {
+  route('POST', '/api/login', (ctx) => {
+    const { body, res } = ctx;
     const loginId = String(body.loginId || '');
     // ID と接続元の組み合わせでロックする（他人がわざと失敗して先生を締め出すことを防ぐ）
-    const key = `${loginId}|${clientIp(req)}`;
+    const key = `${loginId}|${ctx.ip}`;
     let f = loginFailures.get(key);
     if (f && f.lockedUntil && f.lockedUntil <= Date.now()) f = null; // ロック期間が明けたらリセット
     if (f && f.lockedUntil > Date.now()) {
@@ -165,13 +202,41 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
         for (const [k, v] of loginFailures) if (!v.lockedUntil || v.lockedUntil < Date.now()) loginFailures.delete(k);
       }
       loginFailures.set(key, { count, lockedUntil: count >= LOGIN_MAX_FAILURES ? Date.now() + LOGIN_LOCK_MS : 0 });
+      store.audit(null, 'ログイン失敗', { target: loginId.slice(0, 40), ip: ctx.ip });
+      store.save();
       throw new AppError('ログインIDまたはパスワードが違います', 401);
     }
     loginFailures.delete(key);
-    const token = crypto.randomBytes(24).toString('hex');
-    sessions.set(token, { userId: user.id, expires: Date.now() + SESSION_TTL_MS });
-    res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_MS / 1000}${secureCookie ? '; Secure' : ''}`);
-    return publicMe(user);
+    if (user.mfa) {
+      // パスワードは正しい。次にスマホアプリの6桁コードを確認する
+      const ticket = crypto.randomBytes(24).toString('hex');
+      mfaTickets.set(ticket, { userId: user.id, expires: Date.now() + MFA_TICKET_MS, tries: 0 });
+      return { mfa: true, ticket };
+    }
+    const session = startSession(res, user);
+    store.audit(user, 'ログイン', { ip: ctx.ip });
+    store.save();
+    return publicMe(user, session);
+  }, { role: 'public' });
+
+  route('POST', '/api/login/mfa', (ctx) => {
+    const { body, res } = ctx;
+    const t = mfaTickets.get(String(body.ticket || ''));
+    if (!t || t.expires < Date.now()) throw new AppError('時間切れです。もう一度ログインしてください', 401);
+    const user = store.user(t.userId);
+    if (!user || user.disabled) throw new AppError('ログインできません', 401);
+    if (!store.verifyMfa(user.id, body.code)) {
+      t.tries += 1;
+      if (t.tries >= MFA_MAX_TRIES) mfaTickets.delete(String(body.ticket));
+      store.audit(user, '2段階認証の失敗', { ip: ctx.ip });
+      store.save();
+      throw new AppError('確認コードが違います', 401);
+    }
+    mfaTickets.delete(String(body.ticket));
+    const session = startSession(res, user);
+    store.audit(user, 'ログイン', { detail: '2段階認証あり', ip: ctx.ip });
+    store.save();
+    return publicMe(user, session);
   }, { role: 'public' });
 
   route('POST', '/api/logout', ({ req, res }) => {
@@ -181,12 +246,27 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
     return { ok: true };
   }, { role: 'public' });
 
-  route('GET', '/api/me', ({ user }) => publicMe(user));
+  route('GET', '/api/me', ({ user, session }) => publicMe(user, session));
+
+  route('POST', '/api/mfa/setup', ({ user }) => {
+    const r = store.startMfaSetup(user.id);
+    store.save();
+    return r;
+  });
+
+  route('POST', '/api/mfa/enable', (ctx) => {
+    store.enableMfa(ctx.user.id, ctx.body.code);
+    ctx.session.mfaSetupRequired = false;
+    log(ctx, '2段階認証の設定');
+    store.save();
+    return publicMe(ctx.user, ctx.session);
+  });
 
   route('GET', '/api/push/key', () => ({ publicKey: store.vapid().publicKey }), { role: 'public' });
 
-  route('POST', '/api/password', ({ user, body }) => {
-    store.changePassword(user.id, String(body.current || ''), body.next);
+  route('POST', '/api/password', (ctx) => {
+    store.changePassword(ctx.user.id, String(ctx.body.current || ''), ctx.body.next);
+    log(ctx, 'パスワード変更');
     store.save();
     return { ok: true };
   });
@@ -221,14 +301,19 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
     return { pending };
   }, { role: 'school' });
 
-  route('POST', '/api/school/discard', ({ org }) => {
-    const pending = store.discardDrafts(org.id);
+  route('POST', '/api/school/discard', (ctx) => {
+    const pending = store.discardDrafts(ctx.org.id);
+    log(ctx, '下書きの破棄');
     store.save();
     return { pending };
   }, { role: 'school' });
 
-  route('POST', '/api/school/publish', ({ org, user, body }) => {
+  route('POST', '/api/school/publish', (ctx) => {
+    const { org, user, body } = ctx;
     const release = store.publish(org.id, user.id, body.message);
+    log(ctx, release.kind === 'revision' ? '下校時刻の修正公開' : '下校時刻の公開', {
+      detail: `${release.changes.length}箇所${release.urgent ? '（当日・翌日の変更を含む）' : ''}`,
+    });
     store.save();
     const decorated = store.decorateRelease(release);
     const forGakudo = { ...decorated, acks: undefined, ackedAt: null };
@@ -241,8 +326,10 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
 
   route('GET', '/api/school/links', ({ org }) => store.linksForSchool(org.id), { role: 'school' });
 
-  route('POST', '/api/school/links/:id', ({ org, user, params, body }) => {
+  route('POST', '/api/school/links/:id', (ctx) => {
+    const { org, user, params, body } = ctx;
     const link = store.decideLink(org.id, params.id, body.approve === true, user.id);
+    log(ctx, link.status === 'approved' ? '学童の受信を承認' : '学童の受信を不承認・停止', { target: (store.org(link.gakudoId) || {}).name });
     store.save();
     notify(link.gakudoId, 'link', { schoolId: org.id, status: link.status });
     return link;
@@ -251,8 +338,10 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
   route('GET', '/api/school/parent-link', ({ org }) =>
     ({ ...store.parentLink(org.id), pushCount: store.parentPushCount(org.id) }), { role: 'school' });
 
-  route('POST', '/api/school/parent-link', ({ org, body }) => {
+  route('POST', '/api/school/parent-link', (ctx) => {
+    const { org, body } = ctx;
     const link = store.setParentLink(org.id, { enabled: body.enabled, regenerate: body.regenerate === true });
+    log(ctx, body.regenerate === true ? '保護者向けリンクの作り直し' : link.enabled ? '保護者向けページの再開' : '保護者向けページの停止');
     store.save();
     return link;
   }, { role: 'school' });
@@ -264,15 +353,17 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
 
   route('GET', '/api/gakudo/links', ({ org }) => store.linksForGakudo(org.id), { role: 'gakudo' });
 
-  route('POST', '/api/gakudo/links', ({ org, body }) => {
-    const link = store.requestLink(org.id, String(body.schoolId || ''));
+  route('POST', '/api/gakudo/links', (ctx) => {
+    const link = store.requestLink(ctx.org.id, String(ctx.body.schoolId || ''));
+    log(ctx, '学校への受信申請', { target: store.org(link.schoolId).name, targetOrg: store.org(link.schoolId) });
     store.save();
-    notify(link.schoolId, 'link-request', { gakudoId: org.id });
+    notify(link.schoolId, 'link-request', { gakudoId: ctx.org.id });
     return link;
   }, { role: 'gakudo' });
 
-  route('DELETE', '/api/gakudo/links/:schoolId', ({ org, params }) => {
-    store.cancelLink(org.id, params.schoolId);
+  route('DELETE', '/api/gakudo/links/:schoolId', (ctx) => {
+    store.cancelLink(ctx.org.id, ctx.params.schoolId);
+    log(ctx, '受信申請の取り消し・受信の停止', { target: (store.org(ctx.params.schoolId) || {}).name });
     store.save();
     return { ok: true };
   }, { role: 'gakudo' });
@@ -301,43 +392,91 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
     return { ok: true };
   }, { role: 'gakudo' });
 
-  // ---- API：運営事務局（アカウント発行） ----
+  // ---- API：アカウント管理（連絡協議会・市町村・各校/学童の管理職） ----
+  // 管理できる範囲は store.canManageOrg で決まる。特定の民間事業者は管理権を持たない。
 
-  route('GET', '/api/admin/orgs', () => store.directory(), { role: 'admin' });
+  const TYPE_LABEL = { council: '連絡協議会', board: '市町村', school: '学校', gakudo: '学童' };
 
-  route('POST', '/api/admin/orgs', ({ body }) => {
-    if (body.type !== 'school' && body.type !== 'gakudo') throw new AppError('種類は学校か学童を選んでください');
-    const org = store.createOrg({ type: body.type, name: body.name, municipality: body.municipality, phone: body.phone });
+  route('GET', '/api/manage/orgs', ({ user }) => store.managedDirectory(user), { role: 'admin' });
+
+  route('POST', '/api/manage/orgs', (ctx) => {
+    const { body } = ctx;
+    const org = store.createOrgAs(ctx.user, {
+      type: body.type, name: body.name, municipality: body.municipality, phone: body.phone, manages: body.manages,
+    });
+    log(ctx, `${TYPE_LABEL[org.type]}の登録`, { target: org.name, targetOrg: org });
     store.save();
     return org;
   }, { role: 'admin' });
 
-  route('POST', '/api/admin/users', ({ body }) => {
-    const user = store.createUser({ orgId: body.orgId, loginId: body.loginId, name: body.name, password: body.password });
+  route('POST', '/api/manage/orgs/:id', (ctx) => {
+    const org = store.updateOrgAs(ctx.user, ctx.params.id, { name: ctx.body.name, phone: ctx.body.phone });
+    log(ctx, '組織情報の変更', { target: org.name, targetOrg: org });
+    store.save();
+    return org;
+  }, { role: 'admin' });
+
+  route('POST', '/api/manage/users', (ctx) => {
+    const { body } = ctx;
+    const user = store.createUserAs(ctx.user, { orgId: body.orgId, loginId: body.loginId, name: body.name, password: body.password, role: body.role });
+    const org = store.org(user.orgId);
+    log(ctx, 'アカウントの発行', { target: `${org.name} ${user.name}（${user.loginId}）`, targetOrg: org });
     store.save();
     return { id: user.id };
   }, { role: 'admin' });
 
-  route('POST', '/api/admin/users/:id/password', ({ params, body }) => {
-    store.resetPassword(params.id, body.password);
-    endSessionsOf(params.id);
+  route('POST', '/api/manage/users/:id/password', (ctx) => {
+    const user = store.resetPasswordAs(ctx.user, ctx.params.id, ctx.body.password);
+    endSessionsOf(user.id);
+    log(ctx, 'パスワードの再発行', { target: `${user.name}（${user.loginId}）`, targetOrg: store.org(user.orgId) });
     store.save();
     return { ok: true };
   }, { role: 'admin' });
 
-  route('GET', '/api/admin/backup', ({ res }) => {
+  route('POST', '/api/manage/users/:id/disabled', (ctx) => {
+    const user = store.setUserDisabledAs(ctx.user, ctx.params.id, ctx.body.disabled === true);
+    if (user.disabled) endSessionsOf(user.id);
+    log(ctx, user.disabled ? 'アカウントの停止' : 'アカウントの再開', { target: `${user.name}（${user.loginId}）`, targetOrg: store.org(user.orgId) });
+    store.save();
+    return { ok: true };
+  }, { role: 'admin' });
+
+  route('POST', '/api/manage/users/:id/mfa-reset', (ctx) => {
+    const user = store.resetMfaAs(ctx.user, ctx.params.id);
+    endSessionsOf(user.id);
+    log(ctx, '2段階認証の解除', { target: `${user.name}（${user.loginId}）`, targetOrg: store.org(user.orgId) });
+    store.save();
+    return { ok: true };
+  }, { role: 'admin' });
+
+  route('GET', '/api/manage/audit', ({ user, query }) => store.auditFor(user, { limit: query.get('limit') }), { role: 'admin' });
+
+  // ---- API：連絡協議会だけの操作 ----
+
+  route('GET', '/api/council/settings', () => store.settings(), { role: 'council' });
+
+  route('POST', '/api/council/settings', (ctx) => {
+    const settings = store.updateSettingsAs(ctx.user, ctx.body);
+    const labels = Object.entries(settings.mfaRequired).filter(([, v]) => v).map(([k]) => TYPE_LABEL[k]);
+    log(ctx, '全体設定の変更', { detail: `2段階認証の必須：${labels.join('・') || 'なし'}` });
+    store.save();
+    return settings;
+  }, { role: 'council' });
+
+  route('POST', '/api/council/purge', (ctx) => {
+    const r = store.purgeBeforeAs(ctx.user, String(ctx.body.before || ''));
+    log(ctx, '保存期間を過ぎたデータの削除', { detail: `${ctx.body.before}より前：下校時刻${r.days}日分・公開履歴${r.releases}件` });
+    store.save();
+    return r;
+  }, { role: 'council' });
+
+  route('GET', '/api/council/backup', (ctx) => {
+    log(ctx, 'バックアップの取得');
+    store.save();
     const name = `backup-${new Date().toISOString().slice(0, 10)}.json`;
-    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    ctx.res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
     return store.data;
-  }, { role: 'admin' });
-
-  route('DELETE', '/api/admin/users/:id', ({ user, params }) => {
-    if (params.id === user.id) throw new AppError('自分自身は削除できません');
-    store.deleteUser(params.id);
-    endSessionsOf(params.id);
-    store.save();
-    return { ok: true };
-  }, { role: 'admin' });
+  }, { role: 'council' });
 
   // ---- API：保護者（ログイン不要。学校が配布したリンクのコードで閲覧） ----
 
@@ -422,14 +561,23 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
         if (!body || typeof body !== 'object') throw new AppError('JSON の形式が正しくありません');
       }
 
-      const user = currentUser(req);
-      const org = user && store.org(user.orgId);
+      const cur = currentSession(req);
+      const user = cur ? cur.user : null;
+      const org = cur ? cur.org : null;
       if (r.role !== 'public') {
         if (!user || !org) throw new AppError('ログインしてください', 401);
-        if (r.role !== 'any' && org.type !== r.role) throw new AppError('この操作は許可されていません', 403);
+        if (cur.session.mfaSetupRequired && !MFA_SETUP_ALLOWED.has(url.pathname)) {
+          throw new AppError('先に2段階認証を設定してください', 403);
+        }
+        const allowed =
+          r.role === 'any' ||
+          (r.role === 'admin' && store.isAdministrator(user)) ||
+          org.type === r.role;
+        if (!allowed) throw new AppError('この操作は許可されていません', 403);
       }
 
-      const result = await r.handler({ req, res, user, org, params, query: url.searchParams, body });
+      const ctx = { req, res, user, org, session: cur && cur.session, ip: clientIp(req), params, query: url.searchParams, body };
+      const result = await r.handler(ctx);
       if (result !== undefined) sendJson(res, 200, result);
     } catch (err) {
       if (err instanceof AppError) return sendJson(res, err.status, { error: err.message });

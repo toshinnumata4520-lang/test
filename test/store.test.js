@@ -10,8 +10,8 @@ function setup(now = new Date('2026-10-05T00:00:00Z')) {
   const store = new Store(undefined, { now: () => now });
   const school = store.createOrg({ type: 'school', name: 'A小', municipality: '沼田市' });
   const teacher = store.createUser({ orgId: school.id, loginId: 'teacher', name: '先生', password: 'password1' });
-  const g1 = store.createOrg({ type: 'gakudo', name: '学童1', phone: '0278-00-0001' });
-  const g2 = store.createOrg({ type: 'gakudo', name: '学童2' });
+  const g1 = store.createOrg({ type: 'gakudo', name: '学童1', municipality: '沼田市', phone: '0278-00-0001' });
+  const g2 = store.createOrg({ type: 'gakudo', name: '学童2', municipality: '沼田市' });
   return { store, school, teacher, g1, g2 };
 }
 
@@ -196,9 +196,108 @@ test('ファイルに保存して読み直せる', (t) => {
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'db.json');
   const a = Store.open(file);
-  const school = a.createOrg({ type: 'school', name: 'A小' });
+  const school = a.createOrg({ type: 'school', name: 'A小', municipality: '沼田市' });
   a.saveDrafts(school.id, { '2026-10-07': G('14:45') });
   a.save();
   const b = Store.open(file);
   assert.equal(b.pendingChanges(school.id).length, 1);
+});
+
+// ---- 管理体制（連絡協議会・市町村・各校の管理職） ----
+
+function governance() {
+  const store = new Store(undefined, { now: () => new Date('2026-10-05T00:00:00Z') });
+  const council = store.createOrg({ type: 'council', name: '協議会' });
+  const cu = store.createUser({ orgId: council.id, loginId: 'council', name: '事務局', password: 'password1', role: 'manager' });
+  const numataBoe = store.createOrg({ type: 'board', name: '沼田市教委', municipality: '沼田市', manages: ['school'] });
+  const nb = store.createUser({ orgId: numataBoe.id, loginId: 'nboe', name: '沼田担当', password: 'password1', role: 'manager' });
+  const numataKodomo = store.createOrg({ type: 'board', name: '沼田市学童担当', municipality: '沼田市', manages: ['gakudo'] });
+  const nk = store.createUser({ orgId: numataKodomo.id, loginId: 'nkodomo', name: '学童担当', password: 'password1', role: 'manager' });
+  const numataSchool = store.createOrg({ type: 'school', name: '沼田A小', municipality: '沼田市' });
+  const principal = store.createUser({ orgId: numataSchool.id, loginId: 'kyoto', name: '教頭', password: 'password1', role: 'manager' });
+  const staff = store.createUser({ orgId: numataSchool.id, loginId: 'kyomu', name: '教務', password: 'password1', role: 'staff' });
+  const minakamiSchool = store.createOrg({ type: 'school', name: 'みなかみB小', municipality: 'みなかみ町' });
+  const gakudo = store.createOrg({ type: 'gakudo', name: '沼田学童', municipality: '沼田市' });
+  return { store, council, cu, numataBoe, nb, numataKodomo, nk, numataSchool, principal, staff, minakamiSchool, gakudo };
+}
+
+test('市町村は自分の市町村の、担当する種類の組織だけを管理できる', () => {
+  const g = governance();
+  const { store } = g;
+  assert.equal(store.canManageOrg(g.nb, g.numataSchool), true);
+  assert.equal(store.canManageOrg(g.nb, g.minakamiSchool), false); // 他の市町村
+  assert.equal(store.canManageOrg(g.nb, g.gakudo), false); // 学童は学童担当課の管轄
+  assert.equal(store.canManageOrg(g.nk, g.gakudo), true);
+  assert.equal(store.canManageOrg(g.cu, g.minakamiSchool), true); // 協議会は全体
+  // 市町村が作る組織は自分の市町村に固定される
+  const created = store.createOrgAs(g.nb, { type: 'school', name: '沼田C小', municipality: 'みなかみ町' });
+  assert.equal(created.municipality, '沼田市');
+  assert.throws(() => store.createOrgAs(g.nb, { type: 'gakudo', name: 'X', municipality: '沼田市' }), /権限がありません/);
+  assert.throws(() => store.createOrgAs(g.cu, { type: 'council', name: 'X' }), /作成できません/);
+});
+
+test('学校の管理職は自校の職員だけを管理でき、一般職員は管理できない', () => {
+  const g = governance();
+  const { store } = g;
+  assert.equal(store.canManageOrg(g.principal, g.numataSchool), true);
+  assert.equal(store.canManageOrg(g.principal, g.minakamiSchool), false);
+  assert.equal(store.canManageOrg(g.staff, g.numataSchool), false);
+  const newcomer = store.createUserAs(g.principal, { orgId: g.numataSchool.id, loginId: 'newteacher', name: '新任', password: 'password1' });
+  assert.equal(newcomer.role, 'staff');
+  assert.throws(() => store.createUserAs(g.staff, { orgId: g.numataSchool.id, loginId: 'x123', name: 'x', password: 'password1' }), /権限がありません/);
+});
+
+test('停止したアカウントはログインできず、再開すれば戻る。自分は停止できない', () => {
+  const g = governance();
+  const { store } = g;
+  store.setUserDisabledAs(g.principal, g.staff.id, true);
+  assert.equal(store.verifyLogin('kyomu', 'password1'), null);
+  store.setUserDisabledAs(g.principal, g.staff.id, false);
+  assert.ok(store.verifyLogin('kyomu', 'password1'));
+  assert.throws(() => store.setUserDisabledAs(g.principal, g.principal.id, true), /自分自身/);
+});
+
+test('2段階認証：正しいコードで有効化、同じコードの使い回しは不可', () => {
+  const totp = require('../lib/totp');
+  const g = governance();
+  const { store } = g;
+  assert.equal(store.mfaRequired(g.cu), true);
+  assert.equal(store.mfaRequired(g.principal), false);
+  const { secret, uri } = store.startMfaSetup(g.cu.id);
+  assert.match(uri, /^otpauth:\/\/totp\//);
+  const step = totp.currentStep(store.now().getTime());
+  assert.throws(() => store.enableMfa(g.cu.id, '000000'.replace(/0/g, (_, i) => String((Number(totp.codeAt(secret, step)[i]) + 1) % 10))), /確認コードが違います/);
+  store.enableMfa(g.cu.id, totp.codeAt(secret, step));
+  assert.equal(store.verifyMfa(g.cu.id, totp.codeAt(secret, step)), false); // 使用済み
+  assert.equal(store.verifyMfa(g.cu.id, totp.codeAt(secret, step + 1)), true);
+  store.resetMfaAs(g.cu, g.cu.id);
+  assert.equal(store.user(g.cu.id).mfa, null);
+});
+
+test('操作履歴は協議会＝全体、市町村＝自分の市町村、管理職＝自組織だけ見える', () => {
+  const g = governance();
+  const { store } = g;
+  store.audit(g.principal, '下校時刻の公開');
+  const other = store.createUser({ orgId: g.minakamiSchool.id, loginId: 'mina', name: 'みなかみ教頭', password: 'password1', role: 'manager' });
+  store.audit(other, '下校時刻の公開');
+  assert.equal(store.auditFor(g.cu).length, 2);
+  assert.deepEqual(store.auditFor(g.nb).map((a) => a.orgName), ['沼田A小']);
+  assert.deepEqual(store.auditFor(g.principal).map((a) => a.orgName), ['沼田A小']);
+  assert.throws(() => store.auditFor(g.staff), /権限がありません/);
+});
+
+test('全体設定とデータ削除は協議会だけ', () => {
+  const g = governance();
+  const { store } = g;
+  assert.throws(() => store.updateSettingsAs(g.nb, { mfaRequired: { school: true } }), /連絡協議会だけ/);
+  assert.equal(store.updateSettingsAs(g.cu, { mfaRequired: { school: true } }).mfaRequired.school, true);
+  assert.equal(store.mfaRequired(g.principal), true);
+
+  const t = g.principal;
+  store.saveDrafts(g.numataSchool.id, { '2025-03-10': G('14:45'), '2026-10-07': G('14:45') });
+  store.publish(g.numataSchool.id, t.id);
+  assert.throws(() => store.purgeBeforeAs(g.nb, '2026-04-01'), /連絡協議会だけ/);
+  const r = store.purgeBeforeAs(g.cu, '2026-04-01');
+  assert.equal(r.days, 1);
+  assert.deepEqual(Object.keys(store.schoolMonth(g.numataSchool.id, '2026-10')), ['2026-10-07']);
 });

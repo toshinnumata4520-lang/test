@@ -50,10 +50,15 @@ test('役割ごとにできる操作が分かれている', async (t) => {
   const gakudo = client();
   await gakudo('POST', '/api/login', { loginId: 'gakudo1', password: 'demo1234' });
   assert.equal((await gakudo('POST', '/api/school/publish', {})).status, 403);
-  assert.equal((await gakudo('GET', '/api/admin/orgs')).status, 403);
+  assert.equal((await gakudo('GET', '/api/council/settings')).status, 403);
+  const staff = client();
+  await staff('POST', '/api/login', { loginId: 'school1-staff', password: 'demo1234' });
+  assert.equal((await staff('GET', '/api/manage/orgs')).status, 403); // 一般職員はアカウント管理不可
   const school = client();
   await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
   assert.equal((await school('GET', '/api/gakudo/releases')).status, 403);
+  const orgs = (await school('GET', '/api/manage/orgs')).body;
+  assert.deepEqual(orgs.map((o) => o.name), ['サンプル沼田第一小学校']); // 管理職は自校だけ
 });
 
 test('JSON 以外の書き込みは拒否（CSRF 対策）', async (t) => {
@@ -118,15 +123,74 @@ test('保護者ページはコードがないと見られない', async (t) => {
   assert.equal((await call('GET', `/api/public/schools/${school1.id}?code=${school1.viewCode}&month=2026-10`)).status, 200);
 });
 
+// 2段階認証が必須の管理者としてログインする（テスト用：コードはサーバーと同じ計算で作る）
+async function loginWithMfa(call, loginId) {
+  const totp = require('../lib/totp');
+  let me = await call('POST', '/api/login', { loginId, password: 'demo1234' });
+  assert.equal(me.body.user.mfaSetupRequired, true);
+  assert.equal((await call('GET', '/api/manage/orgs')).status, 403); // 設定前は何もできない
+  const { secret } = (await call('POST', '/api/mfa/setup')).body;
+  me = await call('POST', '/api/mfa/enable', { code: totp.codeAt(secret, totp.currentStep()) });
+  assert.equal(me.status, 200);
+  return secret;
+}
+
 test('パスワード再発行で本人のログイン中セッションは切れる', async (t) => {
   const { client, store } = await start(t);
   const teacher = client();
   await teacher('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
-  const admin = client();
-  await admin('POST', '/api/login', { loginId: 'admin', password: 'demo1234' });
+  const boe = client();
+  await loginWithMfa(boe, 'numata-boe');
   const user = store.data.users.find((u) => u.loginId === 'school1');
-  assert.equal((await admin('POST', `/api/admin/users/${user.id}/password`, { password: 'newpass123' })).status, 200);
+  assert.equal((await boe('POST', `/api/manage/users/${user.id}/password`, { password: 'newpass123' })).status, 200);
   assert.equal((await teacher('GET', '/api/me')).status, 401);
+});
+
+test('2段階認証を設定した管理者は、次回からコードがないとログインできない', async (t) => {
+  const totp = require('../lib/totp');
+  const { client } = await start(t);
+  const secret = await loginWithMfa(client(), 'council');
+  const again = client();
+  const first = await again('POST', '/api/login', { loginId: 'council', password: 'demo1234' });
+  assert.equal(first.body.mfa, true);
+  assert.equal((await again('GET', '/api/me')).status, 401); // パスワードだけではログインできない
+  assert.equal((await again('POST', '/api/login/mfa', { ticket: first.body.ticket, code: '000000' })).status, 401);
+  const ok = await again('POST', '/api/login/mfa', { ticket: first.body.ticket, code: totp.codeAt(secret, totp.currentStep() + 1) });
+  assert.equal(ok.status, 200);
+  assert.equal((await again('GET', '/api/me')).status, 200);
+});
+
+test('市町村は他の市町村の学校を管理できない・停止したアカウントは即ログアウト', async (t) => {
+  const { client, store } = await start(t);
+  const boe = client();
+  await loginWithMfa(boe, 'minakami-boe');
+  const names = (await boe('GET', '/api/manage/orgs')).body.map((o) => o.name);
+  assert.ok(names.includes('サンプルみなかみ小学校'));
+  assert.ok(!names.includes('サンプル沼田第一小学校'));
+  const numataTeacher = store.data.users.find((u) => u.loginId === 'school1');
+  assert.equal((await boe('POST', `/api/manage/users/${numataTeacher.id}/disabled`, { disabled: true })).status, 403);
+
+  const principal = client();
+  await principal('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
+  const staffCall = client();
+  await staffCall('POST', '/api/login', { loginId: 'school1-staff', password: 'demo1234' });
+  const staff = store.data.users.find((u) => u.loginId === 'school1-staff');
+  assert.equal((await principal('POST', `/api/manage/users/${staff.id}/disabled`, { disabled: true })).status, 200);
+  assert.equal((await staffCall('GET', '/api/me')).status, 401);
+  assert.equal((await client()('POST', '/api/login', { loginId: 'school1-staff', password: 'demo1234' })).status, 401);
+});
+
+test('公開・承認・ログインなどが操作履歴に残る', async (t) => {
+  const { client } = await start(t);
+  const school = client();
+  await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
+  await school('PUT', '/api/school/entries', { days: { '2030-01-10': { grades: ['13:00'], note: '' } } });
+  await school('POST', '/api/school/publish', {});
+  await client()('POST', '/api/login', { loginId: 'school1', password: 'wrong' });
+  const council = client();
+  await loginWithMfa(council, 'council');
+  const actions = (await council('GET', '/api/manage/audit')).body.map((a) => a.action);
+  for (const a of ['ログイン', '下校時刻の公開', 'ログイン失敗', '2段階認証の設定']) assert.ok(actions.includes(a), a);
 });
 
 function fakeSubscription(n) {
@@ -232,14 +296,14 @@ test('保護者ページには今後の日付の「修正」だけが最近の�
   assert.equal(res.body.updates[0].publishedByName, undefined); // 先生の名前は出さない
 });
 
-test('バックアップは事務局だけが取得できる', async (t) => {
+test('バックアップは連絡協議会だけが取得できる', async (t) => {
   const { client } = await startWithPush(t);
-  const admin = client();
-  await admin('POST', '/api/login', { loginId: 'admin', password: 'demo1234' });
-  const res = await admin('GET', '/api/admin/backup');
+  const council = client();
+  await loginWithMfa(council, 'council');
+  const res = await council('GET', '/api/council/backup');
   assert.equal(res.status, 200);
   assert.ok(Array.isArray(res.body.orgs));
-  const school = client();
-  await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
-  assert.equal((await school('GET', '/api/admin/backup')).status, 403);
+  const boe = client();
+  await loginWithMfa(boe, 'numata-boe');
+  assert.equal((await boe('GET', '/api/council/backup')).status, 403);
 });

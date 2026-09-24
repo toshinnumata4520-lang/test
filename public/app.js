@@ -216,6 +216,7 @@ async function boot() {
     return renderLogin();
   }
   renderAccount();
+  if (state.me.user.mfaSetupRequired) return renderMfaSetup(); // 管理者は2段階認証の設定が済むまで他の操作をさせない
   startEvents();
   const type = state.me.org.type;
   if (type === 'school') {
@@ -228,24 +229,27 @@ async function boot() {
     await syncGakudoPush();
     renderGakudo();
   } else {
-    renderAdmin();
+    state.tab = 'orgs';
+    renderManage();
   }
 }
 
 function renderLogin() {
   accountEl.innerHTML = '';
   const demo = [
-    ['school1', '学校（沼田第一小）'],
+    ['school1', '学校・管理職（沼田第一小 教頭）'],
+    ['school1-staff', '学校・職員（沼田第一小 教務）'],
     ['school2', '学校（沼田第二小）'],
     ['gakudo1', '学童（学習塾 学童クラブ）'],
-    ['gakudo2', '学童（放課後児童クラブ）'],
     ['gakudo3', '学童（みなかみ学童）'],
-    ['admin', '運営事務局'],
+    ['numata-boe', '沼田市教育委員会'],
+    ['numata-kodomo', '沼田市 学童担当課'],
+    ['council', '連絡協議会 事務局'],
   ];
   appEl.innerHTML = `
     <div class="card login">
       <h1>ログイン</h1>
-      <p class="muted">学校・学童の職員の方は、運営事務局から発行されたIDでログインしてください。<br>保護者の方は、学校から配布されたリンクから閲覧できます（ログイン不要）。</p>
+      <p class="muted">学校・学童の職員の方は、各市町村（教育委員会等）または所属先の管理職から発行されたIDでログインしてください。<br>保護者の方は、学校から配布されたリンクから閲覧できます（ログイン不要）。</p>
       <form id="login-form">
         <label for="loginId">ログインID</label>
         <input id="loginId" autocomplete="username" required>
@@ -256,7 +260,7 @@ function renderLogin() {
       </form>
       <hr>
       <div class="demo-accounts">
-        <p class="muted">デモ用アカウント（パスワードはすべて <code>demo1234</code>）</p>
+        <p class="muted">デモ用アカウント（パスワードはすべて <code>demo1234</code>）<br>教育委員会・協議会は最初に2段階認証の設定を求められます。</p>
         ${demo.map(([id, label]) => `<button class="btn small" data-demo="${id}">${esc(label)}</button>`).join('')}
       </div>
       <p class="muted"><a href="/terms.html">利用規約・プライバシーポリシー（案）</a></p>
@@ -271,7 +275,8 @@ function renderLogin() {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
-      await api('POST', '/api/login', { loginId: form.loginId.value.trim(), password: form.password.value });
+      const r = await api('POST', '/api/login', { loginId: form.loginId.value.trim(), password: form.password.value });
+      if (r.mfa) return renderMfaLogin(r.ticket);
       location.reload();
     } catch (err) {
       document.getElementById('login-error').textContent = err.message;
@@ -279,12 +284,94 @@ function renderLogin() {
   });
 }
 
+// パスワードの次に、スマホの認証アプリの6桁コードを入れる
+function renderMfaLogin(ticket) {
+  appEl.innerHTML = `
+    <div class="card login">
+      <h1>2段階認証</h1>
+      <p>スマホの認証アプリ（Google Authenticator など）に表示されている<b>6桁の数字</b>を入力してください。</p>
+      <form id="mfa-form">
+        <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required placeholder="123456" class="code-input">
+        <p class="error" id="mfa-error"></p>
+        <button class="btn primary">ログイン</button>
+        <a class="btn" href="/">やり直す</a>
+      </form>
+      <p class="muted">スマホをなくした・機種変更した場合は、所属先の管理者（教育委員会など）に2段階認証の解除を依頼してください。</p>
+    </div>`;
+  const form = appEl.querySelector('#mfa-form');
+  form.code.focus();
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      await api('POST', '/api/login/mfa', { ticket, code: form.code.value.replace(/\s/g, '') });
+      location.reload();
+    } catch (err) {
+      appEl.querySelector('#mfa-error').textContent = err.message;
+      if (err.status === 401 && /時間切れ/.test(err.message)) setTimeout(() => location.reload(), 1500);
+    }
+  });
+}
+
+function mfaSetupHtml(setup) {
+  const key = setup.secret.replace(/(.{4})/g, '$1 ').trim();
+  return `
+    <ol class="mfa-steps">
+      <li>スマホに認証アプリを入れます（<b>Google Authenticator</b> または <b>Microsoft Authenticator</b>。どちらも無料）。</li>
+      <li>アプリで「＋」→「<b>セットアップキーを入力</b>」を選び、次のとおり入力します。
+        <dl class="mfa-key">
+          <dt>アカウント名</dt><dd>${esc(state.me.user.loginId)}（何でも構いません）</dd>
+          <dt>キー</dt><dd><code>${esc(key)}</code></dd>
+          <dt>種類</dt><dd>時間ベース</dd>
+        </dl>
+        <p class="muted">この画面をスマホで開いている場合は <a href="${esc(setup.uri)}">ここを押すとアプリに登録</a>できます。</p>
+      </li>
+      <li>アプリに表示された<b>6桁の数字</b>を下に入力して「設定する」を押します。</li>
+    </ol>
+    <form id="mfa-enable-form" class="row">
+      <input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required placeholder="123456" class="code-input">
+      <button class="btn primary">設定する</button>
+    </form>`;
+}
+
+async function bindMfaSetup(root, onDone) {
+  root.querySelector('#mfa-enable-form').addEventListener('submit', withErrors(async (e) => {
+    e.preventDefault();
+    state.me = await api('POST', '/api/mfa/enable', { code: e.target.code.value.replace(/\s/g, '') });
+    toast('2段階認証を設定しました。次回からログイン時に6桁の数字が必要です');
+    onDone();
+  }));
+}
+
+// 管理者（協議会・市町村など）は最初のログインで必ず設定する
+async function renderMfaSetup() {
+  const setup = await api('POST', '/api/mfa/setup');
+  appEl.innerHTML = `
+    <div class="card mfa-card">
+      <h1>2段階認証の設定（必須）</h1>
+      <p>この役割のアカウントは、パスワードが漏れても不正にログインされないよう、<b>2段階認証が必須</b>です。設定は最初の1回だけ、3分ほどで終わります。</p>
+      ${mfaSetupHtml(setup)}
+    </div>`;
+  bindMfaSetup(appEl, () => location.reload());
+}
+
 function renderAccount() {
   const { user, org } = state.me;
   accountEl.innerHTML = `
-    <span>${esc(org.name)}<br><small>${esc(user.name)}</small></span>
+    <span>${esc(org.name)}<br><small>${esc(user.name)}${user.role === 'manager' ? '（管理者）' : ''}</small></span>
+    ${!user.mfaEnabled && !user.mfaSetupRequired ? '<button class="btn small" id="mfa-btn">2段階認証を設定</button>' : ''}
     <button class="btn small" id="pw-btn">パスワード変更</button>
     <button class="btn small" id="logout-btn">ログアウト</button>`;
+  const mfaBtn = document.getElementById('mfa-btn');
+  if (mfaBtn) mfaBtn.addEventListener('click', withErrors(async () => {
+    const setup = await api('POST', '/api/mfa/setup');
+    const dlg = openDialog(`<div class="dialog-body"><h2>2段階認証の設定</h2>
+      <p>設定すると、ログイン時にパスワードに加えてスマホの6桁の数字が必要になり、安全性が高まります。</p>${mfaSetupHtml(setup)}</div>
+      <div class="dialog-actions"><button type="button" class="btn" data-close>閉じる</button></div>`);
+    bindMfaSetup(dlg, () => {
+      dlg.close();
+      renderAccount();
+    });
+  }));
   document.getElementById('logout-btn').addEventListener('click', async () => {
     await api('POST', '/api/logout');
     location.href = '/';
@@ -376,9 +463,11 @@ async function renderSchool() {
     ['releases', '公開履歴・確認状況'],
     ['links', '学童からの受信申請', pendingLinks],
     ['parent', '保護者向けリンク'],
+    ...adminTabs(),
   ]);
   appEl.appendChild(body);
   bindTabs(renderSchool);
+  if (await renderAdminTab(body)) return;
   if (state.tab === 'input') await renderSchoolInput(body, links);
   if (state.tab === 'releases') await renderSchoolReleases(body);
   if (state.tab === 'links') renderSchoolLinks(body, links);
@@ -792,10 +881,12 @@ async function renderGakudo() {
     ['today', '今日・今週の下校時刻'],
     ['news', 'お知らせ（公開・修正）', unread.length],
     ['schools', '受け取る学校・通知設定'],
+    ...adminTabs(),
   ]);
   appEl.appendChild(body);
   bindTabs(renderGakudo);
   bindPushBar();
+  if (await renderAdminTab(body)) return;
   if (state.tab === 'today') await renderGakudoToday(body, unread);
   if (state.tab === 'news') renderGakudoNews(body, releases);
   if (state.tab === 'schools') await renderGakudoSchools(body);
@@ -912,71 +1003,209 @@ async function renderGakudoSchools(el) {
     })));
 }
 
-// ---------------------------------------------------------------- 運営事務局
+// ---------------------------------------------------------------- 管理（協議会・市町村・各校/学童の管理職）
 
-async function renderAdmin() {
-  const orgs = await api('GET', '/api/admin/orgs');
-  const label = { school: '学校', gakudo: '学童', admin: '運営事務局' };
+const TYPE_LABEL = { council: '連絡協議会', board: '市町村（教育委員会等）', school: '学校', gakudo: '学童' };
+
+// 学校・学童の管理職に出す追加タブ
+function adminTabs() {
+  return state.me.user.isAdmin ? [['staff', '職員アカウント'], ['audit', '操作履歴']] : [];
+}
+
+async function renderAdminTab(el) {
+  if (state.tab === 'staff') await renderManageOrgs(el);
+  else if (state.tab === 'audit') await renderAudit(el);
+  else return false;
+  return true;
+}
+
+async function renderManage() {
+  const { org } = state.me;
+  const isCouncil = org.type === 'council';
+  const scope = isCouncil
+    ? '利根沼田地域の全体（すべての市町村・学校・学童）'
+    : `${org.municipality}の${org.manages.map((t) => TYPE_LABEL[t]).join('・')}`;
+  const body = document.createElement('div');
   appEl.innerHTML = `
-    <h1>アカウント管理（運営事務局）</h1>
-    <p class="muted">学校・学童のアカウントは事務局だけが発行できます。先生・職員ごとにアカウントを分けると、誰が公開したか履歴に残ります。</p>
-    <section class="card row"><span><b>バックアップ</b>：全データを1つのファイルとして保存します。定期的に保存し、安全な場所に保管してください（パスワードは暗号化された状態で含まれます）。</span>
-      <span class="spacer"></span><a class="btn" href="/api/admin/backup" download>バックアップを保存</a></section>
-    <section class="card">
-      <h2>学校・学童を追加</h2>
-      <form id="org-form" class="row">
-        <select name="type"><option value="school">学校</option><option value="gakudo">学童</option></select>
-        <input name="name" placeholder="名前" required>
-        <input name="municipality" placeholder="市町村（例：沼田市）">
-        <input name="phone" placeholder="電話番号（学童のみ・緊急連絡用）">
-        <button class="btn primary">追加</button>
-      </form>
-    </section>
-    ${['school', 'gakudo', 'admin'].map((type) => `<section class="card"><h2>${label[type]}</h2>
-      <div class="table-wrap"><table class="grid admin-table"><thead><tr><th>名前</th><th>市町村</th><th>アカウント</th><th></th></tr></thead><tbody>
-      ${orgs.filter((o) => o.type === type).map((o) => `<tr><td class="date">${esc(o.name)}${o.phone ? `<br><small class="muted">☎ ${esc(o.phone)}</small>` : ''}</td><td>${esc(o.municipality)}</td>
-        <td class="date">${o.users.map((u) => `<div class="user-line">${esc(u.name)} <code>${esc(u.loginId)}</code>
-          <button class="btn small" data-reset="${u.id}">パスワード再発行</button>
-          <button class="btn small danger" data-del="${u.id}" data-name="${esc(u.name)}">削除</button></div>`).join('') || '<span class="muted">なし</span>'}</td>
-        <td><button class="btn small" data-add-user="${o.id}" data-org="${esc(o.name)}">アカウント追加</button></td></tr>`).join('')}
-      </tbody></table></div></section>`).join('')}`;
+    <h1>${isCouncil ? '連絡協議会 管理画面' : `${esc(org.name)} 管理画面`}</h1>
+    <p class="muted">管理できる範囲：<b>${esc(scope)}</b>。下校時刻の入力・公開は各学校が行います。この画面ではアカウントの発行・停止と、操作履歴の確認を行います。</p>
+    ${tabsHtml([
+      ['orgs', '組織・アカウント'],
+      ['audit', '操作履歴'],
+      ...(isCouncil ? [['settings', '全体設定・データ管理']] : []),
+    ])}`;
+  appEl.appendChild(body);
+  bindTabs(renderManage);
+  if (state.tab === 'orgs') await renderManageOrgs(body);
+  if (state.tab === 'audit') await renderAudit(body);
+  if (state.tab === 'settings') await renderCouncilSettings(body);
+}
 
-  appEl.querySelector('#org-form').addEventListener('submit', withErrors(async (e) => {
-    e.preventDefault();
-    const f = e.target;
-    await api('POST', '/api/admin/orgs', { type: f.type.value, name: f.name.value, municipality: f.municipality.value, phone: f.phone.value });
-    toast('追加しました。続けてアカウントを発行してください');
-    renderAdmin();
-  }));
-  appEl.querySelectorAll('[data-add-user]').forEach((b) =>
+function fmtLastLogin(iso) {
+  return iso ? fmtDateTime(iso) : '未ログイン';
+}
+
+async function renderManageOrgs(el) {
+  const orgs = await api('GET', '/api/manage/orgs');
+  const own = state.me.org;
+  const creatable = own.type === 'council' ? ['board', 'school', 'gakudo'] : own.type === 'board' ? own.manages : [];
+  const types = ['council', 'board', 'school', 'gakudo'].filter((t) => orgs.some((o) => o.type === t));
+  el.innerHTML = `
+    ${own.type === 'school' || own.type === 'gakudo' ? `<p class="muted">異動・退職した職員のアカウントは<b>停止</b>してください（履歴に名前を残すため、削除ではなく停止にしています）。新しく来た職員のアカウントはここで発行できます。</p>` : ''}
+    ${creatable.length ? `<section class="card">
+      <h2>組織を登録</h2>
+      <form id="org-form" class="org-form">
+        <select name="type">${creatable.map((t) => `<option value="${t}">${TYPE_LABEL[t]}</option>`).join('')}</select>
+        <input name="name" placeholder="名前（例：沼田市立〇〇小学校）" required>
+        ${own.type === 'council' ? '<input name="municipality" placeholder="市町村（例：沼田市）">' : `<span class="muted">市町村：${esc(own.municipality)}</span>`}
+        <input name="phone" placeholder="電話番号（学童は緊急連絡用）">
+        <span class="board-only chk-group">管理対象：<label class="chk"><input type="checkbox" name="manages" value="school" checked>学校</label><label class="chk"><input type="checkbox" name="manages" value="gakudo">学童</label></span>
+        <button class="btn primary">登録</button>
+      </form>
+    </section>` : ''}
+    ${types.map((type) => `<section class="card"><h2>${TYPE_LABEL[type]}</h2>
+      ${orgs.filter((o) => o.type === type).map((o) => `<div class="org-block">
+        <div class="row"><h3>${esc(o.name)}</h3><span class="muted">${esc(o.municipality)}${o.manages ? ` ／ 管理対象：${o.manages.map((t) => TYPE_LABEL[t]).join('・')}` : ''}${o.phone ? ` ／ ☎ ${esc(o.phone)}` : ''}</span>
+          <span class="spacer"></span>
+          <button class="btn small" data-edit-org="${o.id}" data-name="${esc(o.name)}" data-phone="${esc(o.phone || '')}">名前・電話を変更</button>
+          <button class="btn small primary" data-add-user="${o.id}" data-org="${esc(o.name)}">アカウント発行</button></div>
+        <div class="table-wrap"><table class="grid users-table"><thead><tr><th>氏名・役職</th><th>ログインID</th><th>権限</th><th>状態</th><th>2段階認証</th><th>最終ログイン</th><th></th></tr></thead><tbody>
+        ${o.users.map((u) => `<tr class="${u.disabled ? 'disabled-row' : ''}"><td class="date">${esc(u.name)}</td><td><code>${esc(u.loginId)}</code></td>
+          <td>${u.role === 'manager' ? '管理者' : '職員'}</td>
+          <td>${u.disabled ? '<span class="tag revision">停止中</span>' : '<span class="tag ok">利用中</span>'}</td>
+          <td>${u.mfaEnabled ? '設定済' : '<span class="muted">未設定</span>'}</td>
+          <td>${esc(fmtLastLogin(u.lastLoginAt))}</td>
+          <td class="row-actions">${u.id === state.me.user.id ? '<span class="muted">（自分）</span>' : `
+            <button class="btn small" data-reset="${u.id}" data-name="${esc(u.name)}">パスワード再発行</button>
+            ${u.mfaEnabled ? `<button class="btn small" data-mfa-reset="${u.id}" data-name="${esc(u.name)}">2段階認証を解除</button>` : ''}
+            <button class="btn small ${u.disabled ? '' : 'danger'}" data-disable="${u.id}" data-to="${u.disabled ? '0' : '1'}" data-name="${esc(u.name)}">${u.disabled ? '再開' : '停止'}</button>`}</td></tr>`).join('') || `<tr><td colspan="7" class="muted">アカウントがありません</td></tr>`}
+        </tbody></table></div></div>`).join('')}
+    </section>`).join('')}`;
+
+  const form = el.querySelector('#org-form');
+  if (form) {
+    const syncBoard = () => el.querySelector('.board-only').classList.toggle('hidden', form.type.value !== 'board');
+    form.type.addEventListener('change', syncBoard);
+    syncBoard();
+    form.addEventListener('submit', withErrors(async (e) => {
+      e.preventDefault();
+      await api('POST', '/api/manage/orgs', {
+        type: form.type.value,
+        name: form.name.value,
+        municipality: form.municipality ? form.municipality.value : own.municipality,
+        phone: form.phone.value,
+        manages: [...form.querySelectorAll('[name=manages]:checked')].map((c) => c.value),
+      });
+      toast('登録しました。続けてアカウントを発行してください');
+      renderAdminView();
+    }));
+  }
+  el.querySelectorAll('[data-add-user]').forEach((b) =>
     b.addEventListener('click', () => {
-      const dlg = openDialog(`<form id="user-form"><div class="dialog-body"><h2>${esc(b.dataset.org)}：アカウント追加</h2>
+      const dlg = openDialog(`<form id="user-form"><div class="dialog-body"><h2>${esc(b.dataset.org)}：アカウント発行</h2>
         <label>氏名・役職<input name="name" required placeholder="例）教頭 沼田太郎"></label>
-        <label>ログインID（半角英数字）<input name="loginId" required pattern="[A-Za-z0-9._\\-]{3,40}"></label>
+        <label>ログインID（半角英数字）<input name="loginId" required pattern="[A-Za-z0-9._\-]{3,40}"></label>
         <label>初期パスワード（8文字以上）<input name="password" required minlength="8"></label>
-        <p class="muted">初回ログイン後、本人にパスワードを変更してもらってください。</p></div>
+        <label>権限<select name="role"><option value="staff">職員（下校時刻の入力・確認など）</option><option value="manager">管理者（上記＋職員アカウントの管理）</option></select></label>
+        <p class="muted">初期パスワードは本人に直接伝え、最初のログイン後に変更してもらってください。</p></div>
         <div class="dialog-actions"><button type="button" class="btn" data-close>キャンセル</button><button class="btn primary">発行する</button></div></form>`);
       dlg.querySelector('#user-form').addEventListener('submit', withErrors(async (e) => {
         e.preventDefault();
         const f = e.target;
-        await api('POST', '/api/admin/users', { orgId: b.dataset.addUser, name: f.name.value, loginId: f.loginId.value, password: f.password.value });
+        await api('POST', '/api/manage/users', { orgId: b.dataset.addUser, name: f.name.value, loginId: f.loginId.value, password: f.password.value, role: f.role.value });
         dlg.close();
-        renderAdmin();
+        toast('アカウントを発行しました');
+        renderAdminView();
       }));
     }));
-  appEl.querySelectorAll('[data-reset]').forEach((b) =>
+  el.querySelectorAll('[data-edit-org]').forEach((b) =>
+    b.addEventListener('click', () => {
+      const dlg = openDialog(`<form id="org-edit"><div class="dialog-body"><h2>組織情報の変更</h2>
+        <label>名前<input name="name" required value="${esc(b.dataset.name)}"></label>
+        <label>電話番号<input name="phone" value="${esc(b.dataset.phone)}"></label></div>
+        <div class="dialog-actions"><button type="button" class="btn" data-close>キャンセル</button><button class="btn primary">保存</button></div></form>`);
+      dlg.querySelector('#org-edit').addEventListener('submit', withErrors(async (e) => {
+        e.preventDefault();
+        await api('POST', `/api/manage/orgs/${b.dataset.editOrg}`, { name: e.target.name.value, phone: e.target.phone.value });
+        dlg.close();
+        renderAdminView();
+      }));
+    }));
+  el.querySelectorAll('[data-reset]').forEach((b) =>
     b.addEventListener('click', withErrors(async () => {
-      const pw = prompt('新しいパスワード（8文字以上）を入力してください');
+      const pw = prompt(`${b.dataset.name} さんの新しいパスワード（8文字以上）を入力してください。\n本人のログイン中の画面は自動的にログアウトされます。`);
       if (!pw) return;
-      await api('POST', `/api/admin/users/${b.dataset.reset}/password`, { password: pw });
-      toast('パスワードを再発行しました');
+      await api('POST', `/api/manage/users/${b.dataset.reset}/password`, { password: pw });
+      toast('パスワードを再発行しました。本人に直接伝えてください');
     })));
-  appEl.querySelectorAll('[data-del]').forEach((b) =>
+  el.querySelectorAll('[data-mfa-reset]').forEach((b) =>
     b.addEventListener('click', withErrors(async () => {
-      if (!confirm(`${b.dataset.name} のアカウントを削除します。よろしいですか？`)) return;
-      await api('DELETE', `/api/admin/users/${b.dataset.del}`);
-      renderAdmin();
+      if (!confirm(`${b.dataset.name} さんの2段階認証を解除します（スマホの紛失・機種変更時）。\n本人確認をしてから行ってください。よろしいですか？`)) return;
+      await api('POST', `/api/manage/users/${b.dataset.mfaReset}/mfa-reset`);
+      toast('解除しました。本人は次回ログイン時に設定し直します');
+      renderAdminView();
     })));
+  el.querySelectorAll('[data-disable]').forEach((b) =>
+    b.addEventListener('click', withErrors(async () => {
+      const stop = b.dataset.to === '1';
+      if (stop && !confirm(`${b.dataset.name} さんのアカウントを停止します（異動・退職時など）。すぐにログアウトされ、ログインできなくなります。よろしいですか？`)) return;
+      await api('POST', `/api/manage/users/${b.dataset.disable}/disabled`, { disabled: stop });
+      toast(stop ? '停止しました' : '再開しました');
+      renderAdminView();
+    })));
+}
+
+function renderAdminView() {
+  const type = state.me.org.type;
+  if (type === 'school') return renderSchool();
+  if (type === 'gakudo') return renderGakudo();
+  return renderManage();
+}
+
+async function renderAudit(el) {
+  const logs = await api('GET', '/api/manage/audit?limit=500');
+  el.innerHTML = `
+    <p class="muted">ログイン・公開・承認・アカウント操作などの記録です（新しい順に最大500件）。記録は変更・削除できません。</p>
+    <div class="table-wrap"><table class="grid audit-table"><thead><tr><th>日時</th><th>組織</th><th>操作した人</th><th>操作</th><th>対象・内容</th><th>接続元</th></tr></thead><tbody>
+    ${logs.map((a) => `<tr class="${/失敗/.test(a.action) ? 'audit-fail' : ''}"><td class="date">${esc(fmtDateTime(a.at))}</td><td class="date">${esc(a.orgName || '―')}</td>
+      <td class="date">${esc(a.userName || '―')}${a.loginId ? `<br><small class="muted">${esc(a.loginId)}</small>` : ''}</td><td class="date">${esc(a.action)}</td>
+      <td class="date">${esc([a.target, a.detail].filter(Boolean).join(' ／ '))}</td><td><small>${esc(a.ip)}</small></td></tr>`).join('') || '<tr><td colspan="6" class="muted">記録がありません</td></tr>'}
+    </tbody></table></div>`;
+}
+
+async function renderCouncilSettings(el) {
+  const settings = await api('GET', '/api/council/settings');
+  const fiscalStart = (() => {
+    const d = new Date();
+    const y = d.getMonth() >= 3 ? d.getFullYear() - 1 : d.getFullYear() - 2; // 前年度の4月1日
+    return `${y}-04-01`;
+  })();
+  el.innerHTML = `
+    <section class="card"><h2>2段階認証を必須にする範囲</h2>
+      <p class="muted">必須にした種類のアカウントは、次回ログイン時に設定を求められます。</p>
+      <form id="mfa-policy">${['council', 'board', 'school', 'gakudo'].map((t) => `<label class="chk"><input type="checkbox" name="${t}" ${settings.mfaRequired[t] ? 'checked' : ''} ${t === 'council' ? 'disabled' : ''}>${TYPE_LABEL[t]}</label>`).join('')}
+        <button class="btn primary small">保存</button></form>
+      <p class="muted">連絡協議会は常に必須です。</p>
+    </section>
+    <section class="card"><h2>保存期間を過ぎたデータの削除</h2>
+      <p>指定した日より前の下校時刻と公開履歴を削除します（運用規程の保存期間に合わせて、年度ごとに行ってください）。操作履歴は削除されません。</p>
+      <form id="purge-form" class="row"><input type="date" name="before" value="${fiscalStart}" required><span>より前を</span><button class="btn danger">削除する</button></form>
+    </section>
+    <section class="card row"><span><b>バックアップ</b>：全データを1つのファイルとして保存します（パスワードは暗号化された状態で含まれます）。保存したファイルは庁内の規程に従って厳重に保管してください。取得したことは操作履歴に記録されます。</span>
+      <span class="spacer"></span><a class="btn" href="/api/council/backup" download>バックアップを保存</a></section>`;
+  el.querySelector('#mfa-policy').addEventListener('submit', withErrors(async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    await api('POST', '/api/council/settings', { mfaRequired: { council: true, board: f.board.checked, school: f.school.checked, gakudo: f.gakudo.checked } });
+    toast('保存しました');
+  }));
+  el.querySelector('#purge-form').addEventListener('submit', withErrors(async (e) => {
+    e.preventDefault();
+    const before = e.target.before.value;
+    if (!confirm(`${before} より前の下校時刻と公開履歴を削除します。元に戻せません。よろしいですか？`)) return;
+    const r = await api('POST', '/api/council/purge', { before });
+    toast(`削除しました（下校時刻 ${r.days}日分・公開履歴 ${r.releases}件）`);
+  }));
 }
 
 // ---------------------------------------------------------------- 保護者（ログイン不要）
