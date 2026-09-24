@@ -128,3 +128,118 @@ test('パスワード再発行で本人のログイン中セッションは切�
   assert.equal((await admin('POST', `/api/admin/users/${user.id}/password`, { password: 'newpass123' })).status, 200);
   assert.equal((await teacher('GET', '/api/me')).status, 401);
 });
+
+function fakeSubscription(n) {
+  const ecdh = require('node:crypto').createECDH('prime256v1');
+  ecdh.generateKeys();
+  return {
+    endpoint: `https://fcm.googleapis.com/fcm/send/device${n}`,
+    keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth: require('node:crypto').randomBytes(16).toString('base64url') },
+  };
+}
+
+async function startWithPush(t, { trustProxy = false } = {}) {
+  const store = new Store();
+  seed(store);
+  const sent = [];
+  let respond = () => 'ok';
+  const server = createApp({ store, trustProxy, pushSender: async (sub, payload) => { sent.push({ sub, payload }); return respond(sub); } });
+  await new Promise((r) => server.listen(0, r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const client = (headersExtra = {}) => {
+    let cookie = '';
+    return async (method, url, body) => {
+      const headers = { cookie, ...headersExtra };
+      if (method !== 'GET') headers['Content-Type'] = 'application/json';
+      const res = await fetch(base + url, { method, headers, body: method !== 'GET' ? JSON.stringify(body ?? {}) : undefined });
+      const set = res.headers.get('set-cookie');
+      if (set) cookie = set.split(';')[0];
+      return { status: res.status, body: await res.json().catch(() => null) };
+    };
+  };
+  return { store, client, sent, setRespond: (f) => { respond = f; } };
+}
+
+const waitFor = async (cond) => {
+  for (let i = 0; i < 50 && !cond(); i++) await new Promise((r) => setTimeout(r, 20));
+};
+
+test('公開すると学童と保護者にプッシュ通知が届き、無効な宛先は削除される', async (t) => {
+  const { store, client, sent, setRespond } = await startWithPush(t);
+  const school1 = store.data.orgs.find((o) => o.name === 'サンプル沼田第一小学校');
+  const gakudo = client();
+  await gakudo('POST', '/api/login', { loginId: 'gakudo1', password: 'demo1234' });
+  assert.equal((await gakudo('POST', '/api/gakudo/push', { subscription: fakeSubscription(1) })).status, 200);
+
+  const parent = client();
+  const q = `code=${school1.viewCode}`;
+  assert.equal((await parent('POST', `/api/public/schools/${school1.id}/push?${q}`, { subscription: fakeSubscription(2) })).status, 200);
+  assert.equal((await parent('POST', `/api/public/schools/${school1.id}/push?code=wrong`, { subscription: fakeSubscription(3) })).status, 404);
+  assert.equal((await parent('POST', `/api/public/schools/${school1.id}/push?${q}`, { subscription: { endpoint: 'https://evil.example.com/x', keys: fakeSubscription(4).keys } })).status, 400);
+
+  setRespond((sub) => (sub.endpoint.endsWith('device2') ? 'gone' : 'ok'));
+  const school = client();
+  await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
+  await school('PUT', '/api/school/entries', { days: { '2030-01-10': { grades: ['13:00'], note: '' } } });
+  await school('POST', '/api/school/publish', { message: '' });
+  await waitFor(() => sent.length >= 2);
+
+  assert.deepEqual(sent.map((s) => s.sub.endpoint.slice(-7)).sort(), ['device1', 'device2']);
+  const toParent = sent.find((s) => s.sub.endpoint.endsWith('device2')).payload;
+  assert.match(toParent.title, /サンプル沼田第一小学校/);
+  assert.match(toParent.url, new RegExp(`code=${school1.viewCode}`));
+  await waitFor(() => store.parentPushCount(school1.id) === 0);
+  assert.equal(store.parentPushCount(school1.id), 0); // 410 が返った宛先は削除
+});
+
+test('保護者リンクを作り直すと保護者の通知登録も解除される', async (t) => {
+  const { store, client } = await startWithPush(t);
+  const school1 = store.data.orgs.find((o) => o.name === 'サンプル沼田第一小学校');
+  const parent = client();
+  await parent('POST', `/api/public/schools/${school1.id}/push?code=${school1.viewCode}`, { subscription: fakeSubscription(1) });
+  assert.equal(store.parentPushCount(school1.id), 1);
+  const school = client();
+  await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
+  await school('POST', '/api/school/parent-link', { regenerate: true });
+  assert.equal(store.parentPushCount(school1.id), 0);
+});
+
+test('ログインのロックは接続元ごと（他の場所からの先生のログインは妨げない）', async (t) => {
+  const { client } = await startWithPush(t, { trustProxy: true });
+  const attacker = client({ 'X-Forwarded-For': '203.0.113.9' });
+  for (let i = 0; i < 5; i++) await attacker('POST', '/api/login', { loginId: 'school1', password: 'x' });
+  assert.equal((await attacker('POST', '/api/login', { loginId: 'school1', password: 'demo1234' })).status, 429);
+  const teacher = client({ 'X-Forwarded-For': '198.51.100.20' });
+  assert.equal((await teacher('POST', '/api/login', { loginId: 'school1', password: 'demo1234' })).status, 200);
+});
+
+test('保護者ページには今後の日付の「修正」だけが最近の変更として出る', async (t) => {
+  const { store, client } = await startWithPush(t);
+  const school1 = store.data.orgs.find((o) => o.name === 'サンプル沼田第一小学校');
+  const school = client();
+  await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
+  await school('PUT', '/api/school/entries', { days: { '2030-01-10': { grades: ['13:00'], note: '' } } });
+  await school('POST', '/api/school/publish', {});
+  let res = await client()('GET', `/api/public/schools/${school1.id}?code=${school1.viewCode}&month=2030-01`);
+  assert.equal(res.body.updates.length, 0); // 新規公開は「変更」扱いしない
+  await school('PUT', '/api/school/entries', { days: { '2030-01-10': { grades: ['12:00'], note: '' } } });
+  await school('POST', '/api/school/publish', { message: '短縮' });
+  res = await client()('GET', `/api/public/schools/${school1.id}?code=${school1.viewCode}&month=2030-01`);
+  assert.equal(res.body.updates.length, 1);
+  assert.equal(res.body.updates[0].message, '短縮');
+  assert.equal(res.body.updates[0].changes[0].after, '12:00');
+  assert.equal(res.body.updates[0].publishedByName, undefined); // 先生の名前は出さない
+});
+
+test('バックアップは事務局だけが取得できる', async (t) => {
+  const { client } = await startWithPush(t);
+  const admin = client();
+  await admin('POST', '/api/login', { loginId: 'admin', password: 'demo1234' });
+  const res = await admin('GET', '/api/admin/backup');
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.body.orgs));
+  const school = client();
+  await school('POST', '/api/login', { loginId: 'school1', password: 'demo1234' });
+  assert.equal((await school('GET', '/api/admin/backup')).status, 403);
+});

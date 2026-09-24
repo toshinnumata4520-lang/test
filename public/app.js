@@ -52,6 +52,67 @@ function desktopNotify(title, body) {
   }
 }
 
+// ---- プッシュ通知（画面を閉じていても届く） ----
+
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const isIos = () => /iPhone|iPad|iPod/.test(navigator.userAgent);
+
+function b64ToBytes(s) {
+  const b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4));
+  return Uint8Array.from(b, (c) => c.charCodeAt(0));
+}
+
+async function currentPushSubscription() {
+  if (!pushSupported() || Notification.permission !== 'granted') return null;
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  return reg.pushManager.getSubscription();
+}
+
+async function enablePush(saveUrl) {
+  if (!pushSupported()) {
+    throw new Error(isIos()
+      ? 'iPhone・iPad では、Safari の共有ボタンから「ホーム画面に追加」をして、追加したアイコンから開くと通知を受け取れます'
+      : 'このブラウザは通知に対応していません。Chrome・Edge・Safari などの最新版でお試しください');
+  }
+  const perm = await Notification.requestPermission();
+  if (perm !== 'granted') throw new Error('通知が許可されませんでした。ブラウザの設定でこのサイトの通知を許可してください');
+  const reg = await navigator.serviceWorker.register('/sw.js');
+  await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    const { publicKey } = await api('GET', '/api/push/key');
+    try {
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(publicKey) });
+    } catch (err) {
+      throw new Error(`通知の登録に失敗しました。ブラウザの設定でこのサイトの通知が許可されているか確認してください（${err.message}）`);
+    }
+  }
+  await api('POST', saveUrl, { subscription: sub.toJSON() });
+}
+
+// ブラウザ側の登録は残し（他の学校・学童の通知に使っている場合があるため）、この登録先だけ解除する
+async function disablePush(url) {
+  const sub = await currentPushSubscription();
+  if (sub) await api('DELETE', url, { endpoint: sub.endpoint });
+}
+
+function storageGet(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function storageSet(key, value) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    /* 保存できない環境では毎回確認する */
+  }
+}
+
 function withErrors(fn) {
   return async (...args) => {
     try {
@@ -164,8 +225,8 @@ async function boot() {
   } else if (type === 'gakudo') {
     state.tab = 'today';
     state.date = todayStr();
+    await syncGakudoPush();
     renderGakudo();
-    askNotificationPermission();
   } else {
     renderAdmin();
   }
@@ -198,6 +259,7 @@ function renderLogin() {
         <p class="muted">デモ用アカウント（パスワードはすべて <code>demo1234</code>）</p>
         ${demo.map(([id, label]) => `<button class="btn small" data-demo="${id}">${esc(label)}</button>`).join('')}
       </div>
+      <p class="muted"><a href="/terms.html">利用規約・プライバシーポリシー（案）</a></p>
     </div>`;
   const form = document.getElementById('login-form');
   appEl.querySelectorAll('[data-demo]').forEach((b) =>
@@ -249,18 +311,32 @@ function renderAccount() {
   });
 }
 
-function askNotificationPermission() {
-  if ('Notification' in window && Notification.permission === 'default') {
-    const bar = document.createElement('div');
-    bar.className = 'card notice no-print';
-    bar.innerHTML = `このパソコン・スマホに通知を出すと、画面を見ていなくても変更に気づけます。
-      <button class="btn small primary" id="notify-ok">通知を許可する</button>`;
-    appEl.before(bar);
-    bar.querySelector('#notify-ok').addEventListener('click', async () => {
-      await Notification.requestPermission();
-      bar.remove();
-    });
+async function syncGakudoPush() {
+  // 以前に通知をオンにしたブラウザなら、登録をサーバーに送り直しておく
+  try {
+    const sub = await currentPushSubscription();
+    state.pushOn = Boolean(sub && storageGet('gakudo-push') === state.me.org.id);
+    if (state.pushOn) await api('POST', '/api/gakudo/push', { subscription: sub.toJSON() });
+  } catch {
+    state.pushOn = false;
   }
+}
+
+function pushBarHtml() {
+  if (state.pushOn) return '';
+  return `<div class="card notice no-print row"><span>🔔 <b>画面を閉じていても、変更があればこのパソコン・スマホに通知</b>できます。</span><span class="spacer"></span>
+    <button class="btn primary small" id="push-on">通知をオンにする</button></div>`;
+}
+
+function bindPushBar() {
+  const btn = appEl.querySelector('#push-on');
+  if (btn) btn.addEventListener('click', withErrors(async () => {
+    await enablePush('/api/gakudo/push');
+    storageSet('gakudo-push', state.me.org.id);
+    state.pushOn = true;
+    toast('通知をオンにしました');
+    renderGakudo();
+  }));
 }
 
 // ---- リアルタイム通知 ----
@@ -272,7 +348,7 @@ function startEvents() {
     const title = `${r.schoolName}が下校時刻を${r.kind === 'revision' ? '修正' : '公開'}しました`;
     const detail = r.urgent ? `【当日・翌日の変更】${r.urgentDates.map(fmtDate).join('、')}` : `${r.changes.length}件の変更`;
     toast(`${title}（${detail}）`, { alert: r.urgent || r.kind === 'revision' });
-    desktopNotify(title, detail);
+    if (!state.pushOn) desktopNotify(title, detail); // プッシュ通知がオンなら二重に出さない
     renderGakudo();
   });
   es.addEventListener('link', (e) => {
@@ -590,10 +666,10 @@ async function openPublishDialog() {
         ${warnings.length ? `<div class="alert"><b>入力ミスの可能性があります。ご確認ください：</b><ul>${warnings.map((w) => `<li>${esc(fmtDate(w.date))}：${esc(w.message)}</li>`).join('')}</ul></div>` : ''}
         <h3>変更点（${changes.length}箇所）</h3>
         ${changesHtml(changes, 30)}
-        <label>学童へのひとこと（任意。変更の理由など）
+        <label>お知らせ文（任意。学童と保護者に表示されます）
           <textarea name="message" maxlength="500" placeholder="例）3年生は校外学習のため、10/3の下校時刻を変更します。"></textarea>
         </label>
-        <p class="muted">通知先：承認済みの学童 ${approved.length} か所${approved.length ? `（${approved.map((l) => esc(l.gakudoName)).join('、')}）` : ''}。保護者向けページにもすぐに反映されます。</p>
+        <p class="muted">通知先：承認済みの学童 ${approved.length} か所${approved.length ? `（${approved.map((l) => esc(l.gakudoName)).join('、')}）` : ''}。保護者向けページにもすぐに反映され、通知を登録している保護者にも届きます。</p>
       </div>
       <div class="dialog-actions">
         <button type="button" class="btn" data-close>戻って修正する</button>
@@ -669,7 +745,8 @@ async function renderSchoolParent(el) {
   el.innerHTML = `
     <section class="card">
       <h2>保護者向け閲覧ページ</h2>
-      <p>保護者はログインなしで、このリンクから公開済みの下校時刻を見られます。学校だより・メール配信などでお知らせください。</p>
+      <p>保護者はログインなしで、このリンクから公開済みの下校時刻を見られます。学校だより・メール配信などでお知らせください。<br>
+      保護者がページで「通知を受け取る」を押すと、公開・修正のたびにスマホへ通知が届きます（現在の登録：<b>${link.pushCount}台</b>）。</p>
       ${link.enabled ? `
         <input class="share-url" readonly value="${esc(url)}">
         <div class="row"><button class="btn primary" id="copy-url">リンクをコピー</button><a class="btn" href="${esc(url)}" target="_blank" rel="noopener">開いて確認</a></div>`
@@ -694,7 +771,7 @@ async function renderSchoolParent(el) {
     toast('リンクをコピーしました');
   });
   el.querySelector('#regen').addEventListener('click', withErrors(async () => {
-    if (!confirm('新しいリンクを作ります。これまでに配布したリンクは見られなくなります。よろしいですか？')) return;
+    if (!confirm('新しいリンクを作ります。これまでに配布したリンクは見られなくなり、保護者の通知登録もすべて解除されます。よろしいですか？')) return;
     await api('POST', '/api/school/parent-link', { regenerate: true });
     toast('新しいリンクを作りました。保護者へ再配布してください');
     renderSchool();
@@ -711,13 +788,14 @@ async function renderGakudo() {
   const releases = await api('GET', '/api/gakudo/releases');
   const unread = releases.filter((r) => !r.ackedAt);
   const body = document.createElement('div');
-  appEl.innerHTML = tabsHtml([
+  appEl.innerHTML = pushBarHtml() + tabsHtml([
     ['today', '今日・今週の下校時刻'],
     ['news', 'お知らせ（公開・修正）', unread.length],
-    ['schools', '受け取る学校'],
+    ['schools', '受け取る学校・通知設定'],
   ]);
   appEl.appendChild(body);
   bindTabs(renderGakudo);
+  bindPushBar();
   if (state.tab === 'today') await renderGakudoToday(body, unread);
   if (state.tab === 'news') renderGakudoNews(body, releases);
   if (state.tab === 'schools') await renderGakudoSchools(body);
@@ -797,6 +875,11 @@ async function renderGakudoSchools(el) {
   const byId = Object.fromEntries(links.map((l) => [l.schoolId, l]));
   const areas = [...new Set(schools.map((s) => s.municipality))];
   el.innerHTML = `
+    <section class="card"><h2>このパソコン・スマホへの通知</h2>
+      ${state.pushOn
+        ? '<p>✅ 通知はオンです。画面を閉じていても、公開・修正があれば通知が届きます。</p><button class="btn small" id="push-off">この端末の通知をオフにする</button>'
+        : '<p>通知はオフです。上の「通知をオンにする」を押してください。職員が使う端末ごとに設定できます。</p>'}
+    </section>
     <p class="muted">児童が通っている学校に「受信を申請」してください。学校が承認すると下校時刻が届くようになります。</p>
     ${areas.map((area) => `<section class="card"><h2>${esc(area)}</h2><ul class="link-list">
       ${schools.filter((s) => s.municipality === area).map((s) => {
@@ -807,6 +890,14 @@ async function renderGakudoSchools(el) {
               : '<span class="tag revision">承認されませんでした</span><button class="btn small" data-req="' + s.id + '">再申請</button>';
         return `<li class="link-item"><div>${esc(s.name)}</div><div class="row">${st}</div></li>`;
       }).join('')}</ul></section>`).join('')}`;
+  const off = el.querySelector('#push-off');
+  if (off) off.addEventListener('click', withErrors(async () => {
+    await disablePush('/api/gakudo/push');
+    storageSet('gakudo-push', null);
+    state.pushOn = false;
+    toast('この端末の通知をオフにしました');
+    renderGakudo();
+  }));
   el.querySelectorAll('[data-req]').forEach((b) =>
     b.addEventListener('click', withErrors(async () => {
       await api('POST', '/api/gakudo/links', { schoolId: b.dataset.req });
@@ -829,6 +920,8 @@ async function renderAdmin() {
   appEl.innerHTML = `
     <h1>アカウント管理（運営事務局）</h1>
     <p class="muted">学校・学童のアカウントは事務局だけが発行できます。先生・職員ごとにアカウントを分けると、誰が公開したか履歴に残ります。</p>
+    <section class="card row"><span><b>バックアップ</b>：全データを1つのファイルとして保存します。定期的に保存し、安全な場所に保管してください（パスワードは暗号化された状態で含まれます）。</span>
+      <span class="spacer"></span><a class="btn" href="/api/admin/backup" download>バックアップを保存</a></section>
     <section class="card">
       <h2>学校・学童を追加</h2>
       <form id="org-form" class="row">
@@ -892,8 +985,20 @@ async function renderParent(params) {
   const month = params.get('month') || todayStr().slice(0, 7);
   const school = params.get('school') || '';
   const code = params.get('code') || '';
+  const q = `code=${encodeURIComponent(code)}`;
+  const pushUrl = `/api/public/schools/${encodeURIComponent(school)}/push?${q}`;
+  const pushKey = `parent-push-${school}`;
   try {
-    const data = await api('GET', `/api/public/schools/${encodeURIComponent(school)}?code=${encodeURIComponent(code)}&month=${month}`);
+    const data = await api('GET', `/api/public/schools/${encodeURIComponent(school)}?${q}&month=${month}`);
+    // 以前に通知をオンにしていれば、登録をサーバーに送り直す（リンク作り直し後などに備える）
+    let pushOn = false;
+    try {
+      const sub = await currentPushSubscription();
+      pushOn = Boolean(sub && storageGet(pushKey) === code);
+      if (pushOn) await api('POST', pushUrl, { subscription: sub.toJSON() });
+    } catch {
+      pushOn = false;
+    }
     const go = (m) => {
       const p = new URLSearchParams(params);
       p.set('month', m);
@@ -902,8 +1007,20 @@ async function renderParent(params) {
     };
     const today = todayStr();
     const dates = monthDates(month).filter((d) => data.days[d] || (dowOf(d) >= 1 && dowOf(d) <= 5));
+    const changed = new Set();
+    for (const u of data.updates) for (const c of u.changes) changed.add(`${c.date}|${c.grade || 'note'}`);
     appEl.innerHTML = `
       <h1>${esc(data.school.name)} 下校時刻</h1>
+      <section class="card no-print row">
+        ${pushOn
+          ? '<span>✅ 変更があるとこの端末に通知が届きます。</span><span class="spacer"></span><button class="btn small" id="push-off">通知をやめる</button>'
+          : '<span>🔔 下校時刻が変わったときに、この端末へ<b>通知</b>を受け取れます（登録は匿名です。名前やメールアドレスは不要）。</span><span class="spacer"></span><button class="btn primary small" id="push-on">通知を受け取る</button>'}
+      </section>
+      ${data.updates.length ? `<section class="card updates"><h2>最近の変更</h2>
+        ${data.updates.map((u) => `<div class="update">
+          <div class="row"><span class="tag revision">修正</span>${u.urgent ? '<span class="tag urgent">当日・翌日の変更</span>' : ''}<span class="meta muted">${esc(fmtDateTime(u.publishedAt))}</span></div>
+          ${u.message ? `<p class="message">${esc(u.message)}</p>` : ''}${changesHtml(u.changes, 6)}</div>`).join('')}
+      </section>` : ''}
       <div class="row">
         <button class="btn no-print" id="prev">◀ 前の月</button>
         <h2>${fmtMonth(month)}</h2>
@@ -916,12 +1033,28 @@ async function renderParent(params) {
         const day = data.days[d];
         const dow = dowOf(d);
         return `<tr class="${dow === 0 ? 'sun' : dow === 6 ? 'sat' : ''}${d === today ? ' is-today' : ''}"><td class="date">${esc(fmtDate(d))}</td>
-          ${day ? day.grades.map((g) => `<td class="time">${esc(timeText(g))}</td>`).join('') + `<td>${esc(day.note)}</td>` : `<td colspan="${GRADES + 1}" class="muted">未定</td>`}</tr>`;
+          ${day ? day.grades.map((g, i) => `<td class="time${changed.has(`${d}|${i + 1}`) ? ' changed-cell' : ''}">${esc(timeText(g))}</td>`).join('') + `<td class="${changed.has(`${d}|note`) ? 'changed-cell' : ''}">${esc(day.note)}</td>` : `<td colspan="${GRADES + 1}" class="muted">未定</td>`}</tr>`;
       }).join('')}</tbody></table></div>
-      <p class="muted">最新の情報は学校が公開した時点で自動的に反映されます。<br>防犯のため、このページのリンクは学校関係者以外に教えないでください。</p>`;
+      <p class="muted">赤い箇所は最近修正された時刻です。学校が公開した時点で自動的に反映されます。<br>
+      防犯のため、このページのリンクは学校関係者以外に教えないでください。<br>
+      <a href="/terms.html">利用規約・プライバシーポリシー（案）</a></p>`;
     appEl.querySelector('#prev').addEventListener('click', () => go(shiftMonth(month, -1)));
     appEl.querySelector('#next').addEventListener('click', () => go(shiftMonth(month, 1)));
     appEl.querySelector('#print').addEventListener('click', () => window.print());
+    const on = appEl.querySelector('#push-on');
+    if (on) on.addEventListener('click', withErrors(async () => {
+      await enablePush(pushUrl);
+      storageSet(pushKey, code);
+      toast('通知を受け取る設定にしました');
+      renderParent(params);
+    }));
+    const off = appEl.querySelector('#push-off');
+    if (off) off.addEventListener('click', withErrors(async () => {
+      await disablePush(pushUrl);
+      storageSet(pushKey, null);
+      toast('通知をやめました');
+      renderParent(params);
+    }));
   } catch (err) {
     appEl.innerHTML = `<div class="card">${esc(err.message)}</div>`;
   }

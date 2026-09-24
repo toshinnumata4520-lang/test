@@ -9,6 +9,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { Store, AppError } = require('./lib/store');
 const { seed } = require('./lib/seed');
+const { sendPush } = require('./lib/webpush');
 
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -22,7 +23,27 @@ const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
 };
+
+const DOW = ['日', '月', '火', '水', '木', '金', '土'];
+
+function fmtDate(date) {
+  const [y, m, d] = date.split('-').map(Number);
+  return `${m}/${d}(${DOW[new Date(Date.UTC(y, m - 1, d)).getUTCDay()]})`;
+}
+
+// 通知に載せる短い要約
+function summarize(release) {
+  if (release.kind === 'new') {
+    const months = [...new Set(release.changes.map((c) => Number(c.date.slice(5, 7))))];
+    return `${months.join('・')}月の下校予定が公開されました`;
+  }
+  const lines = release.changes.slice(0, 3).map((c) =>
+    `${fmtDate(c.date)} ${c.field === 'note' ? '備考' : `${c.grade}年`} ${c.before || '未設定'}→${c.after || 'なし'}`);
+  if (release.changes.length > 3) lines.push(`ほか${release.changes.length - 3}件`);
+  return (release.urgent ? '【当日・翌日の変更】' : '') + lines.join('、');
+}
 
 // 全レスポンス共通のセキュリティヘッダ。検索エンジンにも載せない（防犯上、下校時刻を広く出さない）
 const SECURITY_HEADERS = {
@@ -33,10 +54,10 @@ const SECURITY_HEADERS = {
   'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-ancestors 'none'",
 };
 
-function createApp({ store }) {
+function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUSH_SUBJECT || 'mailto:admin@example.com', secureCookie = process.env.SECURE_COOKIE === '1', trustProxy = process.env.TRUST_PROXY === '1' }) {
   const sessions = new Map(); // token -> { userId, expires }
   const streams = new Map(); // orgId -> Set<res>
-  const loginFailures = new Map(); // loginId -> { count, lockedUntil }
+  const loginFailures = new Map(); // `${loginId}|${ip}` -> { count, lockedUntil }
   const routes = [];
 
   function route(method, pattern, handler, { role = 'any' } = {}) {
@@ -54,7 +75,45 @@ function createApp({ store }) {
     for (const res of set) res.write(data);
   }
 
+  // ---- プッシュ通知（画面を閉じていても届く） ----
+
+  async function deliverPush(release) {
+    const school = store.org(release.schoolId);
+    const vapid = store.vapid();
+    const body = summarize(release);
+    const verb = release.kind === 'revision' ? '修正' : '公開';
+    const jobs = [];
+    for (const gakudoId of release.recipients) {
+      for (const sub of store.pushSubs('gakudo', gakudoId)) {
+        jobs.push({ kind: 'gakudo', owner: gakudoId, sub, payload: { title: `${school.name}：下校時刻の${verb}`, body, url: '/', tag: release.id } });
+      }
+    }
+    if (school.parentLinkEnabled) {
+      const url = `/?view=parent&school=${school.id}&code=${school.viewCode}`;
+      for (const sub of store.pushSubs('parents', school.id)) {
+        jobs.push({ kind: 'parents', owner: school.id, sub, payload: { title: `${school.name}：下校時刻が${verb}されました`, body, url, tag: release.id } });
+      }
+    }
+    let removed = false;
+    for (let i = 0; i < jobs.length; i += 50) {
+      const chunk = jobs.slice(i, i + 50);
+      const results = await Promise.all(chunk.map((j) => pushSender(j.sub, j.payload, { vapid, subject: pushSubject, urgent: release.urgent })));
+      results.forEach((r, k) => {
+        if (r === 'gone') {
+          store.removePush(chunk[k].kind, chunk[k].owner, chunk[k].sub.endpoint);
+          removed = true;
+        }
+      });
+    }
+    if (removed) store.save();
+  }
+
   // ---- 認証 ----
+
+  function clientIp(req) {
+    if (trustProxy && req.headers['x-forwarded-for']) return String(req.headers['x-forwarded-for']).split(',')[0].trim();
+    return req.socket.remoteAddress || '';
+  }
 
   function parseCookies(req) {
     const out = {};
@@ -90,9 +149,11 @@ function createApp({ store }) {
 
   // ---- API：共通 ----
 
-  route('POST', '/api/login', ({ body, res }) => {
+  route('POST', '/api/login', ({ req, body, res }) => {
     const loginId = String(body.loginId || '');
-    let f = loginFailures.get(loginId);
+    // ID と接続元の組み合わせでロックする（他人がわざと失敗して先生を締め出すことを防ぐ）
+    const key = `${loginId}|${clientIp(req)}`;
+    let f = loginFailures.get(key);
     if (f && f.lockedUntil && f.lockedUntil <= Date.now()) f = null; // ロック期間が明けたらリセット
     if (f && f.lockedUntil > Date.now()) {
       throw new AppError('ログインに続けて失敗したため、10分間ログインできません', 429);
@@ -100,13 +161,16 @@ function createApp({ store }) {
     const user = store.verifyLogin(loginId, String(body.password || ''));
     if (!user) {
       const count = (f ? f.count : 0) + 1;
-      loginFailures.set(loginId, { count, lockedUntil: count >= LOGIN_MAX_FAILURES ? Date.now() + LOGIN_LOCK_MS : 0 });
+      if (loginFailures.size > 10000) {
+        for (const [k, v] of loginFailures) if (!v.lockedUntil || v.lockedUntil < Date.now()) loginFailures.delete(k);
+      }
+      loginFailures.set(key, { count, lockedUntil: count >= LOGIN_MAX_FAILURES ? Date.now() + LOGIN_LOCK_MS : 0 });
       throw new AppError('ログインIDまたはパスワードが違います', 401);
     }
-    loginFailures.delete(loginId);
+    loginFailures.delete(key);
     const token = crypto.randomBytes(24).toString('hex');
     sessions.set(token, { userId: user.id, expires: Date.now() + SESSION_TTL_MS });
-    res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_MS / 1000}`);
+    res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_MS / 1000}${secureCookie ? '; Secure' : ''}`);
     return publicMe(user);
   }, { role: 'public' });
 
@@ -118,6 +182,8 @@ function createApp({ store }) {
   }, { role: 'public' });
 
   route('GET', '/api/me', ({ user }) => publicMe(user));
+
+  route('GET', '/api/push/key', () => ({ publicKey: store.vapid().publicKey }), { role: 'public' });
 
   route('POST', '/api/password', ({ user, body }) => {
     store.changePassword(user.id, String(body.current || ''), body.next);
@@ -167,6 +233,7 @@ function createApp({ store }) {
     const decorated = store.decorateRelease(release);
     const forGakudo = { ...decorated, acks: undefined, ackedAt: null };
     for (const gakudoId of release.recipients) notify(gakudoId, 'release', forGakudo);
+    deliverPush(release).catch((err) => console.error('push failed', err));
     return decorated;
   }, { role: 'school' });
 
@@ -181,7 +248,8 @@ function createApp({ store }) {
     return link;
   }, { role: 'school' });
 
-  route('GET', '/api/school/parent-link', ({ org }) => store.parentLink(org.id), { role: 'school' });
+  route('GET', '/api/school/parent-link', ({ org }) =>
+    ({ ...store.parentLink(org.id), pushCount: store.parentPushCount(org.id) }), { role: 'school' });
 
   route('POST', '/api/school/parent-link', ({ org, body }) => {
     const link = store.setParentLink(org.id, { enabled: body.enabled, regenerate: body.regenerate === true });
@@ -214,6 +282,18 @@ function createApp({ store }) {
 
   route('GET', '/api/gakudo/releases', ({ org }) => store.releasesForGakudo(org.id), { role: 'gakudo' });
 
+  route('POST', '/api/gakudo/push', ({ org, body }) => {
+    store.addPush('gakudo', org.id, body.subscription);
+    store.save();
+    return { ok: true };
+  }, { role: 'gakudo' });
+
+  route('DELETE', '/api/gakudo/push', ({ org, body }) => {
+    store.removePush('gakudo', org.id, String(body.endpoint || ''));
+    store.save();
+    return { ok: true };
+  }, { role: 'gakudo' });
+
   route('POST', '/api/gakudo/releases/:id/ack', ({ org, params }) => {
     const release = store.acknowledge(params.id, org.id);
     store.save();
@@ -245,6 +325,12 @@ function createApp({ store }) {
     return { ok: true };
   }, { role: 'admin' });
 
+  route('GET', '/api/admin/backup', ({ res }) => {
+    const name = `backup-${new Date().toISOString().slice(0, 10)}.json`;
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    return store.data;
+  }, { role: 'admin' });
+
   route('DELETE', '/api/admin/users/:id', ({ user, params }) => {
     if (params.id === user.id) throw new AppError('自分自身は削除できません');
     store.deleteUser(params.id);
@@ -257,6 +343,20 @@ function createApp({ store }) {
 
   route('GET', '/api/public/schools/:id', ({ params, query }) =>
     store.publicSchoolMonth(params.id, query.get('code'), query.get('month') || ''), { role: 'public' });
+
+  route('POST', '/api/public/schools/:id/push', ({ params, query, body }) => {
+    store.assertParentCode(params.id, query.get('code'));
+    store.addPush('parents', params.id, body.subscription);
+    store.save();
+    return { ok: true };
+  }, { role: 'public' });
+
+  route('DELETE', '/api/public/schools/:id/push', ({ params, query, body }) => {
+    store.assertParentCode(params.id, query.get('code'));
+    store.removePush('parents', params.id, String(body.endpoint || ''));
+    store.save();
+    return { ok: true };
+  }, { role: 'public' });
 
   // ---- HTTP ハンドラ ----
 
@@ -348,6 +448,7 @@ if (require.main === module) {
   const store = Store.open(file);
   if (store.isEmpty()) {
     seed(store);
+    store.vapid();
     store.save();
     console.log('デモデータを作成しました（パスワードはすべて demo1234）');
   }

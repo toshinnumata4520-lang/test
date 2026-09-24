@@ -195,3 +195,7 @@ dialog .alert ul { margin: 4px 0; padding-left: 20px; }
   .grid tr.is-today { outline: none; }
   .card { border: none; padding: 0; }
 }
+.updates .update { border-bottom: 1px solid var(--line); padding: 6px 0; }
+.updates .update:last-child { border-bottom: none; }
+.terms { max-width: 800px; }
+.terms h2 { margin-top: 24px; }
