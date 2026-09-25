@@ -262,10 +262,14 @@ function renderLogin() {
       <div class="demo-accounts">
         <p class="muted">デモ用アカウント（パスワードはすべて <code>demo1234</code>）<br>教育委員会・協議会は最初に2段階認証の設定を求められます。</p>
         ${demo.map(([id, label]) => `<button class="btn small" data-demo="${id}">${esc(label)}</button>`).join('')}
+        <button class="btn small" id="demo-parent">保護者（沼田第一小の閲覧ページ・ログイン不要）</button>
       </div>
       <p class="muted"><a href="/terms.html">利用規約・プライバシーポリシー（案）</a></p>
     </div>`;
   const form = document.getElementById('login-form');
+  document.getElementById('demo-parent').addEventListener('click', withErrors(async () => {
+    location.href = (await api('GET', '/api/demo/parent-link')).path;
+  }));
   appEl.querySelectorAll('[data-demo]').forEach((b) =>
     b.addEventListener('click', () => {
       form.loginId.value = b.dataset.demo;

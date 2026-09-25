@@ -262,6 +262,14 @@ function createApp({ store, pushSender = sendPush, pushSubject = process.env.PUS
     return publicMe(ctx.user, ctx.session);
   });
 
+  // デモ用：保護者の閲覧ページへのリンクを返す。デモデータ（パスワード demo1234 の school1）がある場合だけ使える
+  const demoMode = Boolean(store.data.users.find((u) => u.loginId === 'school1') && store.verifyLogin('school1', 'demo1234'));
+  route('GET', '/api/demo/parent-link', () => {
+    if (!demoMode) throw new AppError('Not Found', 404);
+    const school = store.org(store.data.users.find((u) => u.loginId === 'school1').orgId);
+    return { path: `/?view=parent&school=${school.id}&code=${school.viewCode}` };
+  }, { role: 'public' });
+
   route('GET', '/api/push/key', () => ({ publicKey: store.vapid().publicKey }), { role: 'public' });
 
   route('POST', '/api/password', (ctx) => {

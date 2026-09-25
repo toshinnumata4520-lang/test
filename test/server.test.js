@@ -61,6 +61,21 @@ test('役割ごとにできる操作が分かれている', async (t) => {
   assert.deepEqual(orgs.map((o) => o.name), ['サンプル沼田第一小学校']); // 管理職は自校だけ
 });
 
+test('デモデータがあるときだけ、保護者ページへのデモ用リンクを返す', async (t) => {
+  const { client, store } = await start(t);
+  const res = await client()('GET', '/api/demo/parent-link');
+  assert.equal(res.status, 200);
+  const school1 = store.data.orgs.find((o) => o.name === 'サンプル沼田第一小学校');
+  assert.match(res.body.path, new RegExp(`code=${school1.viewCode}`));
+
+  const empty = new Store();
+  const server = createApp({ store: empty });
+  await new Promise((r) => server.listen(0, r));
+  t.after(() => server.close());
+  const r2 = await fetch(`http://127.0.0.1:${server.address().port}/api/demo/parent-link`);
+  assert.equal(r2.status, 404); // 本番（デモデータなし）では使えない
+});
+
 test('JSON 以外の書き込みは拒否（CSRF 対策）', async (t) => {
   const { base } = await start(t);
   const res = await fetch(`${base}/api/login`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'loginId=school1&password=demo1234' });
