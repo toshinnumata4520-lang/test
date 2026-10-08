@@ -30,17 +30,24 @@ try {
   }
 
   Write-Host '3/3 NASで組み立てて起動します（NASのパスワードを聞かれたら入力）…' -ForegroundColor Cyan
-  $cmd = "cd $Dir && $Docker build -t ondoku-demo . && ($Docker rm -f ondoku-demo >/dev/null 2>&1; true) && " +
-         "$Docker run -d --name ondoku-demo --restart unless-stopped -p 127.0.0.1:3101:3100 --env-file $Dir/ondoku.env ondoku-demo && " +
-         "sleep 2 && wget -qO- http://127.0.0.1:3101/api/config"
+  # NAS側で実行する命令（使う番号は port ファイルに記録し、更新時も同じ番号を使う）
+  $remote = 'cd DIR || exit 1; ' +
+    'DOCKER build -t ondoku-demo . || exit 1; ' +
+    'DOCKER rm -f ondoku-demo >/dev/null 2>&1; ' +
+    'test -s port || { P=3101; while (netstat -tln 2>/dev/null; DOCKER ps -a --format {{.Ports}}) | grep -Eq :$P''([^0-9]|$)''; do P=$((P+1)); done; echo $P > port; }; ' +
+    'P=$(cat port); ' +
+    'DOCKER run -d --name ondoku-demo --restart unless-stopped -p 127.0.0.1:$P:3100 --env-file DIR/ondoku.env ondoku-demo || exit 1; ' +
+    'sleep 2; wget -qO- http://127.0.0.1:$P/api/config || exit 1; echo; echo PORT=$P'
+  $cmd = $remote.Replace('DIR', $Dir).Replace('DOCKER', $Docker)
   ssh -t -i $Key "$User@$Nas" $cmd
   if ($LASTEXITCODE -ne 0) { throw 'NASでの起動に失敗しました（上の表示を Claude に貼ってください）' }
 
   Write-Host ''
   Write-Host '起動しました。{"needCode":true} と表示されていれば正常です。' -ForegroundColor Green
+  Write-Host '上に出た PORT= の番号を、リバースプロキシの宛先ポートに使います。'
   Write-Host '初回だけ、DSM でリバースプロキシを作ってください：'
   Write-Host '  コントロールパネル → ログインポータル → 詳細設定 → リバースプロキシ → 作成'
-  Write-Host '  名前 ondoku-demo ／ ソース HTTPS・ondoku.griff-juku.synology.me・443 ／ 宛先 HTTP・127.0.0.1・3101'
+  Write-Host '  名前 ondoku-demo ／ ソース HTTPS・ondoku.griff-juku.synology.me・443 ／ 宛先 HTTP・127.0.0.1・（PORT= の番号）'
   Write-Host '公開先：https://ondoku.griff-juku.synology.me' -ForegroundColor Green
 } catch {
   Write-Host "エラー：$($_.Exception.Message)" -ForegroundColor Red

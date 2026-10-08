@@ -28,7 +28,7 @@
 | 置き場所 | `/volume1/docker/ondoku-demo/`（共有フォルダ `\\192.168.0.4\docker\ondoku-demo`） |
 | 設定ファイル | `ondoku.env`（鍵と合言葉。このリポジトリには入れない） |
 | コンテナ名 | `ondoku-demo`（`--restart unless-stopped`） |
-| ポート | NAS内の `127.0.0.1:3101` → コンテナ `3100`（3100番は下校時刻デモが使用中） |
+| ポート | NAS内の `127.0.0.1:（3101番から空いている番号）` → コンテナ `3100`。選んだ番号は `ondoku-demo/port` に記録し、更新時も同じ番号を使う |
 | データ | なし（録音も保存しない） |
 
 ### 手順
@@ -45,14 +45,14 @@
    ```
    - 合言葉を入れた人だけが「AI にくわしく見てもらう」を使えます（その場の判定は合言葉なしで使えます）。
    - AI の助言は、1つの接続元につき1時間30回までです。
-4. NAS上でビルド・起動（パスワードを聞かれたら入力）
+4. NAS上でビルド・起動（パスワードを聞かれたら入力。3101番が使用中なら、空いている番号に変える。スクリプトなら自動）
    ```powershell
    ssh -t -i C:\Users\griff010\.ssh\synology_griff takezawa@192.168.0.4 "cd /volume1/docker/ondoku-demo && sudo /usr/local/bin/docker build -t ondoku-demo . && sudo /usr/local/bin/docker run -d --name ondoku-demo --restart unless-stopped -p 127.0.0.1:3101:3100 --env-file /volume1/docker/ondoku-demo/ondoku.env ondoku-demo"
    ```
 5. DSM → コントロールパネル → ログインポータル → 詳細設定 → リバースプロキシ → 作成
    - 名前 `ondoku-demo`
    - ソース：HTTPS／`ondoku.griff-juku.synology.me`／443
-   - 宛先：HTTP／`127.0.0.1`／3101
+   - 宛先：HTTP／`127.0.0.1`／スクリプトの最後に出た `PORT=` の番号
 6. スマホで https://ondoku.griff-juku.synology.me を開き、マイクを許可して試す
 
 ### 更新するとき
