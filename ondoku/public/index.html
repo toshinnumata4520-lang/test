@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>音読チェック（試作品）</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>英語 音読チェック</h1>
+  <p class="sub">英文を声に出して読むと、単語ごとに発音をチェックします（試作品）</p>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1. 読む英文をえらぶ</h2>
+    <label for="passage">見本文</label>
+    <select id="passage"></select>
+    <label for="text">英文（自由に書きかえられます）</label>
+    <textarea id="text" rows="4" maxlength="1000" spellcheck="false"></textarea>
+    <div class="row">
+      <button id="listen" type="button" class="secondary">▶ 見本を聞く</button>
+      <label class="inline"><input type="checkbox" id="slow"> ゆっくり</label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. 音読する</h2>
+    <p class="hint">ボタンを押してから、英文をはっきり読んでください。読み終わったら「おわり」を押します（最長60秒）。</p>
+    <div class="row">
+      <button id="rec" type="button" class="primary">● 録音スタート</button>
+      <span id="timer" class="timer" aria-live="polite"></span>
+    </div>
+    <p id="live" class="live" aria-live="polite"></p>
+    <p id="warn" class="warn" hidden></p>
+  </section>
+
+  <section class="card" id="resultCard" hidden>
+    <h2>3. 結果</h2>
+    <div class="score"><span id="score">0</span><small>点</small></div>
+    <p class="legend">
+      <span class="w ok">合っている</span>
+      <span class="w close">おしい</span>
+      <span class="w wrong">ちがう</span>
+      <span class="w missing">ぬけ</span>
+      <span class="note">単語を押すと見本の発音が聞けます</span>
+    </p>
+    <p id="words" class="words"></p>
+    <p id="extra" class="extra" hidden></p>
+    <p id="heard" class="heard"></p>
+    <div class="row">
+      <button id="playMine" type="button" class="secondary">▶ 自分の声を聞く</button>
+      <button id="ai" type="button" class="primary">AI にくわしく見てもらう</button>
+    </div>
+    <p class="hint">「AI にくわしく見てもらう」を押すと、録音が Google の AI（Gemini）に送られます。名前など個人が分かることは話さないでください。</p>
+  </section>
+
+  <section class="card" id="aiCard" hidden>
+    <h2>AI 先生のアドバイス</h2>
+    <div id="aiBody" aria-live="polite"></div>
+  </section>
+</main>
+
+<script src="compare.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
