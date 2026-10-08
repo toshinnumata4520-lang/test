@@ -13,8 +13,10 @@ npm run ondoku          # http://localhost:3100
 | `GEMINI_API_KEY` | Gemini の鍵（「AI にくわしく見てもらう」に必要） |
 | `GEMINI_MODEL` | 使うモデル（省略時 `gemini-flash-latest`） |
 | `PORT` | ポート番号（省略時 3100） |
+| `ACCESS_CODE` | 合言葉。入れると、合言葉を知っている人だけが AI の助言を使える |
+| `TRUST_PROXY` | `1` にすると、リバースプロキシ越しの接続元で回数制限する |
 
-マイクは https か localhost でないと使えません。
+マイクは https か localhost でないと使えません。試し方・NASでの公開は [NAS公開手順.md](NAS公開手順.md)。
 
 ## しくみ
 

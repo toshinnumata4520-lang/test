@@ -1,10 +1,11 @@
 'use strict';
 // 音読・発音チェック 試作品のサーバー（外部ライブラリなし）
 //   起動：node ondoku/server.js   →  http://localhost:3100
-//   環境変数：PORT / GEMINI_API_KEY / GEMINI_MODEL
+//   環境変数：PORT / GEMINI_API_KEY / GEMINI_MODEL / ACCESS_CODE（合言葉）/ TRUST_PROXY
 
 const http = require('node:http');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const passages = require('./lib/passages');
 const { askGemini } = require('./lib/gemini');
@@ -13,6 +14,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 8 * 1024 * 1024; // 録音は1分程度まで
 const MAX_TEXT = 1000;
 const AUDIO_TYPES = ['audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/aac'];
+const LIMIT_PER_HOUR = 30; // AI 助言の回数制限（1つの接続元あたり）
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
@@ -62,20 +64,52 @@ function validateAdvice(body) {
   return { text, audio, mimeType };
 }
 
+function sameCode(a, b) {
+  const x = crypto.createHash('sha256').update(String(a)).digest();
+  const y = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y);
+}
+
+function clientIp(req, trustProxy) {
+  const fwd = trustProxy && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return fwd || req.socket.remoteAddress || '';
+}
+
 function createServer(deps = {}) {
   const advise = deps.askGemini || askGemini;
+  const accessCode = deps.accessCode !== undefined ? deps.accessCode : (process.env.ACCESS_CODE || '');
+  const trustProxy = deps.trustProxy !== undefined ? deps.trustProxy : process.env.TRUST_PROXY === '1';
+  const limit = deps.limitPerHour || LIMIT_PER_HOUR;
+  const used = new Map(); // 接続元 → この1時間に使った時刻の一覧
   return http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     try {
       if (req.method === 'GET' && url.pathname === '/api/passages') {
         return send(res, 200, passages);
       }
+      if (req.method === 'GET' && url.pathname === '/api/config') {
+        return send(res, 200, { needCode: Boolean(accessCode) });
+      }
       if (req.method === 'POST' && url.pathname === '/api/advice') {
         if (!String(req.headers['content-type'] || '').startsWith('application/json')) {
           return send(res, 415, { error: 'JSON で送ってください' });
         }
+        let given = '';
+        try { given = decodeURIComponent(req.headers['x-access-code'] || ''); } catch { /* 壊れた値は不一致扱い */ }
+        if (accessCode && !sameCode(given, accessCode)) {
+          return send(res, 401, { error: '合言葉がちがいます' });
+        }
+        const ip = clientIp(req, trustProxy);
+        const now = Date.now();
+        const recent = (used.get(ip) || []).filter((t) => now - t < 3600 * 1000);
+        if (recent.length >= limit) {
+          return send(res, 429, { error: 'AI の助言は1時間に' + limit + '回までです。しばらくしてから試してください。' });
+        }
         const v = validateAdvice(await readJson(req));
         if (typeof v === 'string') return send(res, 400, { error: v });
+        recent.push(now);
+        used.set(ip, recent);
+        if (used.size > 5000) used.clear(); // 念のため増えすぎを防ぐ
         return send(res, 200, await advise(v));
       }
       if (req.method === 'GET') {

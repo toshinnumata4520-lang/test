@@ -19,6 +19,15 @@
       + '<option value="custom">自分で入力する</option>';
     $('text').value = list[0] ? list[0].text : '';
   });
+  fetch('/api/config').then((r) => r.json()).then((c) => {
+    if (!c.needCode) return;
+    show($('codeRow'));
+    try { $('code').value = localStorage.getItem('ondokuCode') || ''; } catch { /* 保存できない端末 */ }
+  });
+  $('code').addEventListener('change', () => {
+    try { localStorage.setItem('ondokuCode', $('code').value); } catch { /* 保存できない端末 */ }
+  });
+
   $('passage').addEventListener('change', (e) => {
     if (e.target.value === 'custom') { $('text').value = ''; $('text').focus(); return; }
     $('text').value = passages[Number(e.target.value)].text;
@@ -177,7 +186,7 @@
       const audio = await toBase64(lastBlob);
       const res = await fetch('/api/advice', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-access-code': encodeURIComponent($('code').value) },
         body: JSON.stringify({ text: lastText, audio, mimeType: lastBlob.type }),
       });
       const data = await res.json();

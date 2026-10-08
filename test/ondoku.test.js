@@ -96,3 +96,19 @@ test('サーバー：画面・見本文・助言・不正な要求', async (t) =
   assert.strictEqual((await fetch(base + '/../server.js')).status, 404);
   assert.strictEqual((await fetch(base + '/%2e%2e/server.js')).status, 404);
 });
+
+test('サーバー：合言葉と回数制限', async (t) => {
+  const server = createServer({ accessCode: 'さくら', limitPerHour: 2, askGemini: async () => ({ score: 1, summary: '', words: [], good: '', next: '' }) });
+  await new Promise((r) => server.listen(0, r));
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  assert.deepStrictEqual(await (await fetch(base + '/api/config')).json(), { needCode: true });
+  const post = (code) => fetch(base + '/api/advice', {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-access-code': encodeURIComponent(code) },
+    body: JSON.stringify({ text: 'Hi', audio: 'AAAA', mimeType: 'audio/webm' }),
+  });
+  assert.strictEqual((await post('ちがう')).status, 401);
+  assert.strictEqual((await post('さくら')).status, 200);
+  assert.strictEqual((await post('さくら')).status, 200);
+  assert.strictEqual((await post('さくら')).status, 429);
+});
